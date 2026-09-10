@@ -1,6 +1,7 @@
 import os
 import time
 import logging
+import threading
 import torch
 from PIL import Image
 import numpy as np
@@ -9,30 +10,42 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 
 class OmniParserEngine:
     _instance = None
+    _lock = threading.Lock()
 
     def __new__(cls, *args, **kwargs):
-        if cls._instance is None:
-            cls._instance = super(OmniParserEngine, cls).__new__(cls)
-            cls._instance._initialized = False
+        with cls._lock:
+            if cls._instance is None:
+                cls._instance = super(OmniParserEngine, cls).__new__(cls)
+                cls._instance._initialized = False
         return cls._instance
 
     def __init__(self, weights_dir=None):
-        if self._initialized:
-            return
+        # Guard against a concurrent warm-up thread and the first real scrape
+        # both running heavy model loading at the same time.
+        with self._lock:
+            if self._initialized:
+                return
 
-        if weights_dir is None:
-            weights_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "weights")
-        self.weights_dir = weights_dir
+            if weights_dir is None:
+                weights_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "weights")
+            self.weights_dir = weights_dir
 
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        logging.info(f"Initializing OmniParserEngine on device: {self.device}")
+            self.device = "cuda" if torch.cuda.is_available() else "cpu"
+            logging.info(f"Initializing OmniParserEngine on device: {self.device}")
 
-        self.yolo_model = None
-        self.ocr_reader = None
-        self._load_models()
-        self._initialized = True
+            self.yolo_model = None
+            self.ocr_reader = None
+            self._load_models()
+            self._initialized = True
 
     def _load_models(self):
+        # 0. Make sure the weights are on disk (download on first run)
+        try:
+            from utils.model_setup import ensure_omniparser_weights
+            ensure_omniparser_weights(self.weights_dir)
+        except Exception as e:
+            logging.warning(f"Could not auto-provision OmniParser weights: {e}")
+
         # 1. Load YOLO icon detection model if weights exist
         icon_detect_path = os.path.join(self.weights_dir, "icon_detect", "model.pt")
         if not os.path.exists(icon_detect_path):

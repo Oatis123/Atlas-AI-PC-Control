@@ -5,13 +5,11 @@ from fastapi import FastAPI, BackgroundTasks
 from pydantic import BaseModel
 from langchain_core.messages import HumanMessage, BaseMessage
 
+from utils.logging_setup import setup_logging
+setup_logging()
+
 from agent.agent import request_to_agent_async, request_to_agent_sync
 from datasama_client import DataSamaClient
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-)
 
 datasama_client = DataSamaClient()
 

@@ -12,7 +12,8 @@ from langchain_core.tools import tool
 
 _SOFTWARE_CACHE = None
 _SOFTWARE_CACHE_TIME = 0
-_MODERN_APPS_CACHE = {}
+_MODERN_APPS_CACHE = {}          # appx Name (lower) -> PackageFamilyName
+_STARTAPPS_CACHE = {}            # friendly Start-menu name (lower) -> AppID
 _CLASSIC_APP_PATHS_CACHE = None
 _CLASSIC_APP_PATHS_CACHE_TIME = 0
 from pywinauto import Desktop
@@ -45,37 +46,64 @@ def _type_unicode_text(text: str):
         pyautogui.hotkey('shift', 'insert') # Pastes layout-independently
         time.sleep(0.05)
 
+def _decamel(text: str) -> str:
+    """`Microsoft.WindowsCalculator` -> `Windows Calculator` (last dotted segment, split on caps)."""
+    segment = text.split('.')[-1]
+    spaced = re.sub(r'(?<=[a-z0-9])(?=[A-Z])', ' ', segment)
+    spaced = re.sub(r'(?<=[A-Z])(?=[A-Z][a-z])', ' ', spaced)
+    return spaced.strip()
+
+
 def _get_installed_software():
-    global _SOFTWARE_CACHE, _SOFTWARE_CACHE_TIME, _MODERN_APPS_CACHE
+    global _SOFTWARE_CACHE, _SOFTWARE_CACHE_TIME, _MODERN_APPS_CACHE, _STARTAPPS_CACHE
     if _SOFTWARE_CACHE is not None and (time.time() - _SOFTWARE_CACHE_TIME < 300):
         return _SOFTWARE_CACHE
 
     all_apps = set()
 
+    # 1. Start-menu apps: friendly names + launchable AppIDs (Win32 shortcuts + UWP).
+    command_startapps = r'Get-StartApps | ForEach-Object { "$($_.Name)|$($_.AppID)" }'
+    result_startapps = subprocess.run(["powershell", "-Command", command_startapps], capture_output=True, text=True, encoding='utf-8', errors='ignore')
+    if result_startapps.returncode == 0:
+        for line in result_startapps.stdout.splitlines():
+            line = line.strip()
+            if '|' in line:
+                name, app_id = line.split('|', 1)
+                name = name.strip()
+                if name:
+                    _STARTAPPS_CACHE[name.lower()] = app_id.strip()
+                    all_apps.add(name)
+
+    # 2. Classic installed programs (registry Uninstall DisplayName).
     command_classic = r'''
-    Get-ItemProperty HKLM:\Software\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*, 
-                     HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*, 
-                     HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\* | 
+    Get-ItemProperty HKLM:\Software\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*,
+                     HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*,
+                     HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\* |
     Where-Object {$_.PSObject.Properties['DisplayName'] -and $_.DisplayName -ne $null} |
     Select-Object -ExpandProperty DisplayName
     '''
-    
+
     result_classic = subprocess.run(["powershell", "-Command", command_classic], capture_output=True, text=True, encoding='utf-8', errors='ignore')
 
     if result_classic.returncode == 0:
         classic_apps = {line.strip() for line in result_classic.stdout.splitlines() if line.strip()}
         all_apps.update(classic_apps)
 
+    # 3. UWP packages: keep PFN map for launching; add de-camelCased names as a fallback.
     command_modern = r'Get-AppxPackage | ForEach-Object { "$($_.Name)|$($_.PackageFamilyName)" }'
     result_modern = subprocess.run(["powershell", "-Command", command_modern], capture_output=True, text=True, encoding='utf-8', errors='ignore')
-    
+
     if result_modern.returncode == 0:
         for line in result_modern.stdout.splitlines():
             line = line.strip()
             if '|' in line:
                 name, pfn = line.split('|', 1)
                 _MODERN_APPS_CACHE[name.lower()] = pfn
-                all_apps.add(name)
+                friendly = _decamel(name)
+                if friendly:
+                    _MODERN_APPS_CACHE[friendly.lower()] = pfn  # launchable via de-camelCased name
+                    if friendly.lower() not in _STARTAPPS_CACHE:
+                        all_apps.add(friendly)
 
     full_list = sorted(list(all_apps))
     
@@ -104,25 +132,44 @@ def get_installed_software():
     return _get_installed_software()
 
 
+def _match_score(app: str, term: str):
+    """Relevance of `app` to query `term`. Lower tuple sorts first; None => no match."""
+    name = app.lower()
+    if name == term:
+        return (0, len(app))
+    if name.startswith(term):
+        return (1, len(app))
+    if re.search(r'\b' + re.escape(term) + r'\b', name):
+        return (2, len(app))
+    if term in name:
+        return (3, len(app))
+    return None
+
+
 @tool
 def find_application_name(approximate_name: str) -> str:
     """
-    Finds exact names of installed applications by an approximate query string.
+    Finds exact names of installed applications by an approximate query string,
+    ranked by relevance (best match first).
 
     Args:
         approximate_name (str): Approximate name of the application to search for (e.g. "chrome").
     """
     all_apps = _get_installed_software()
-    
-    search_term = approximate_name.lower()
-    
-    # Collect all partial matches
-    matches = [app for app in all_apps if search_term in app.lower()]
-    
-    if matches:
-        return "Found matching applications:\n" + "\n".join(f"- {app}" for app in matches)
-    
-    return f"Error: Application '{approximate_name}' was not found among installed software."
+    term = approximate_name.strip().lower()
+
+    scored = []
+    for app in all_apps:
+        score = _match_score(app, term)
+        if score is not None:
+            scored.append((score, app))
+
+    if not scored:
+        return f"Error: Application '{approximate_name}' was not found among installed software."
+
+    scored.sort(key=lambda x: x[0])
+    ranked = [app for _, app in scored][:10]
+    return "Found matching applications (best match first):\n" + "\n".join(f"- {app}" for app in ranked)
 
 
 def _get_classic_app_paths():
@@ -172,46 +219,54 @@ def _get_classic_app_paths():
     return app_paths
 
 
+def _best_key(mapping, term: str):
+    """Return the key of `mapping` most relevant to `term` (via _match_score), or None."""
+    best, best_score = None, None
+    for key in mapping:
+        score = _match_score(key, term)
+        if score is not None and (best_score is None or score < best_score):
+            best, best_score = key, score
+    return best
+
+
 def _start_application_by_name(app_name: str) -> bool:
-    app_name_lower = app_name.lower()
+    term = app_name.strip().lower()
 
-    try:
-        classic_app_map = _get_classic_app_paths()
-        for name, path in classic_app_map.items():
-            if app_name_lower in name:
-                subprocess.Popen(shlex.split(f'"{path}"'))
-                time.sleep(2.0)
-                return True
-    except Exception as e:
-        print(f"Ошибка при поиске в реестре: {e}")
+    if not _STARTAPPS_CACHE or not _MODERN_APPS_CACHE:
+        _get_installed_software()
 
+    # 1. Start-menu AppID — most reliable for both Win32 shortcuts and UWP apps.
     try:
-        if not _MODERN_APPS_CACHE:
-            _get_installed_software()
-            
-        found_pfn = None
-        for name, pfn in _MODERN_APPS_CACHE.items():
-            if app_name_lower in name:
-                found_pfn = pfn
-                break
-                
-        if found_pfn:
-            launch_command = f'explorer.exe shell:appsFolder\\{found_pfn}!App'
-            subprocess.Popen(launch_command, shell=True)
+        key = _best_key(_STARTAPPS_CACHE, term)
+        if key:
+            app_id = _STARTAPPS_CACHE[key]
+            subprocess.Popen(f'explorer.exe shell:AppsFolder\\{app_id}', shell=True)
             time.sleep(2.0)
             return True
     except Exception as e:
-        print(f"Ошибка при поиске современных приложений: {e}")
+        logging.warning(f"Start-menu launch failed for '{app_name}': {e}")
 
+    # 2. Classic executable path from the registry.
     try:
-        simple_name = app_name_lower.split(' ')[0]
-        subprocess.Popen(f'start {simple_name}', shell=True)
-        time.sleep(2.0)
-        return True
+        key = _best_key(_get_classic_app_paths(), term)
+        if key:
+            subprocess.Popen(shlex.split(f'"{_get_classic_app_paths()[key]}"'))
+            time.sleep(2.0)
+            return True
     except Exception as e:
-        print(f"Простой запуск не удался: {e}")
+        logging.warning(f"Registry-path launch failed for '{app_name}': {e}")
 
-    print(f"Не удалось найти и запустить приложение: '{app_name}'")
+    # 3. UWP package family name fallback.
+    try:
+        key = _best_key(_MODERN_APPS_CACHE, term)
+        if key:
+            subprocess.Popen(f'explorer.exe shell:appsFolder\\{_MODERN_APPS_CACHE[key]}!App', shell=True)
+            time.sleep(2.0)
+            return True
+    except Exception as e:
+        logging.warning(f"UWP launch failed for '{app_name}': {e}")
+
+    logging.error(f"Could not find/launch application: '{app_name}'")
     return False
 
 
@@ -368,7 +423,7 @@ def interact_with_element_by_id(
 
     Args:
         name (str): Часть заголовка окна приложения для поиска. Например, 'Mozilla Firefox' или 'Калькулятор'.
-        element (int): ID целевого элемента, полученный от `scrape_application`. 
+        element_id (int): ID целевого элемента (число из атрибута id="..." в выводе `scrape_application`). Передавай именно параметр `element_id`.
         action (str): Действие, которое необходимо выполнить над элементом. Поддерживаемые действия:
                       - Клики: 'click', 'double_click', 'right_click'.
                       - Работа с текстом: 'set_text', 'get_text', 'press_enter'.
@@ -436,7 +491,12 @@ def interact_with_element_by_id(
             main_win.type_keys('~')
             
         elif action == 'get_text':
-            return ELEMENTS_CACHE.get(element_id, {}).get("name", "")
+            text = ELEMENTS_CACHE.get(element_id, {}).get("name", "") or ""
+            # "Icon_N" — это ярлык-заглушка детектора иконок, а не распознанный текст.
+            if not text.strip() or re.fullmatch(r"Icon_\d+", text.strip()):
+                return (f"У элемента id={element_id} нет распознанного текста. "
+                        f"Читай значения прямо из результата scrape_application.")
+            return text
 
         elif action == 'scroll_up':
             pyautogui.moveTo(center_x, center_y)
@@ -482,21 +542,44 @@ def simulate_keyboard(name: str, keys: str) -> str:
     try:
         main_win = _get_window_by_name(name)
         main_win.set_focus()
-        time.sleep(0.2)  # Даем окну время на получение фокуса
+        time.sleep(0.4)  # Даем окну время реально получить фокус (0.2 не хватало — терялся первый символ)
 
-        # Проверяем, является ли это горячей клавишей (содержит +)
-        if '+' in keys and len(keys) < 15:
-            # Например, 'ctrl+c' -> ['ctrl', 'c']
-            keys_list = [k.strip().lower() for k in keys.split('+')]
-            pyautogui.hotkey(*keys_list)
+        _MODIFIERS = {
+            'ctrl', 'control', 'alt', 'altleft', 'altright', 'shift', 'shiftleft',
+            'shiftright', 'win', 'winleft', 'winright', 'command', 'cmd', 'option',
+            'optionleft', 'optionright', 'fn', 'super', 'meta',
+        }
+
+        # Горячая клавиша — только если части разделены '+', каждая является
+        # реальной клавишей и хотя бы одна из НЕ последних является модификатором.
+        # Иначе '1+1=' и подобное — это обычный ввод текста, а не 'ctrl+c'.
+        parts = [k.strip().lower() for k in keys.split('+')]
+        is_hotkey = (
+            '+' in keys
+            and len(parts) >= 2
+            and all(p in pyautogui.KEYBOARD_KEYS for p in parts)
+            and any(p in _MODIFIERS for p in parts[:-1])
+        )
+
+        if is_hotkey:
+            pyautogui.hotkey(*parts)
             return f"Выполнено нажатие комбинации клавиш: {keys}"
-        
+
         # Проверяем, является ли это одиночной специальной клавишей
         elif keys.lower() in pyautogui.KEYBOARD_KEYS:
             pyautogui.press(keys.lower())
             return f"Выполнено нажатие специальной клавиши: {keys}"
-        
-        # Иначе просто вводим текст
+
+        # Короткая ASCII-строка (например '1+1=') — шлём реальные нажатия клавиш.
+        # Так ввод доходит до приложений, которые игнорируют вставку из буфера
+        # (в частности UWP-Калькулятор не реагирует на Shift+Insert).
+        elif keys.isascii() and '\n' not in keys and len(keys) <= 30:
+            pyautogui.press('shift')   # «разбудить» ввод в окне, чтобы не потерять первый символ
+            time.sleep(0.1)
+            pyautogui.write(keys, interval=0.05)
+            return f"Выполнен ввод символов: {keys}"
+
+        # Иначе (длинный или не-ASCII текст) — быстрый и надёжный путь через буфер.
         else:
             _type_unicode_text(keys)
             return f"Выполнен ввод текста: {keys}"

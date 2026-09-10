@@ -16,6 +16,7 @@ yolo11n.pt
 vosk-model-small-ru-0.22
 test.py
 agent_logs.txt
+logs/
 vosk-model-ru-0.42
 screenshots
 temp_speech.mp3

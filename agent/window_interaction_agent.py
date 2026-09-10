@@ -15,14 +15,14 @@ import langchain
 
 import json
 
-logging.basicConfig(
-    level=logging.INFO,
-    handlers=[
-        logging.FileHandler('agent_logs.txt', mode='a', encoding='utf-8'),
-        logging.StreamHandler()
-    ],
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
+# Logging is configured once by utils.logging_setup.setup_logging() at process
+# start (see main.py / server.py). Fall back to a basic console config only when
+# this module is imported standalone.
+if not logging.getLogger().handlers:
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
 
 tools = [
     scrape_application, 
@@ -33,7 +33,7 @@ tools = [
 ]
 
 tools_by_name = {tool.name: tool for tool in tools}
-model_with_tools = gemma4_31b.bind_tools(tools)
+model_with_tools = laguna_s_21.bind_tools(tools)
 
 class AgentState(TypedDict):
     messages: list[BaseMessage]
@@ -41,7 +41,13 @@ class AgentState(TypedDict):
     screenshot_ids_to_hide: Annotated[list[str], operator.add]
     last_search_web_id: str | None
 
- 
+
+def _short(text, limit: int = 1200) -> str:
+    """One-line, length-capped preview of a value for log output."""
+    s = str(text).replace("\n", " ⏎ ")
+    return s if len(s) <= limit else f"{s[:limit]}… (+{len(s) - limit} символов)"
+
+
 async def agent_node(state):
     logging.info("--- [Window Agent] Вход в agent_node ---")
     # Ensure AI message content is not empty when tool calls exist
@@ -69,7 +75,15 @@ async def agent_node(state):
 
     elapsed = time.time() - model_start_time
     logging.info(f"⏱️ [Window Agent LLM TIME] Ответ модели получен за {elapsed:.4f} сек. Содержит tool_calls: {bool(getattr(response, 'tool_calls', None))}")
-    
+
+    reasoning = (getattr(response, "additional_kwargs", {}) or {}).get("reasoning_content")
+    if reasoning:
+        logging.info(f"[Window Agent] Рассуждение: {_short(reasoning)}")
+    if getattr(response, "content", ""):
+        logging.info(f"[Window Agent] Ответ: {_short(response.content)}")
+    for tc in getattr(response, "tool_calls", None) or []:
+        logging.info(f"[Window Agent] → план: {tc['name']}({tc.get('args', {})})")
+
     # 2. КРИТИЧЕСКИ ВАЖНО: склеиваем старую историю с новым ответом!
     return {"messages": state["messages"] + [response]}
 
@@ -152,6 +166,7 @@ async def tool_node(state: AgentState) -> dict:
                 observation = await tool.ainvoke(tool_call["args"])
                 elapsed = time.time() - tool_start_time
                 logging.info(f"⏱️ [Window Agent TOOL TIME] Инструмент '{tool_call['name']}' выполнен за {elapsed:.4f} сек.")
+                logging.info(f"[Window Agent] Результат '{tool_call['name']}': {_short(observation)}")
                 new_tool_results.append(ToolMessage(content=str(observation), tool_call_id=tool_call["id"]))
         except Exception as tool_err:
             logging.error(f"[Window Agent] Ошибка вызова инструмента {tool_call['name']}: {tool_err}")
