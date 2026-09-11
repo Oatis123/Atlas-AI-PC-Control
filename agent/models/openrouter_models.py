@@ -55,3 +55,10 @@ laguna_s_21 = ChatOpenRouter(
     openrouter_provider={"sort": "latency"},
     reasoning={"effort": "none"}
 )
+
+vlm_vision = ChatOpenRouter(
+    model="qwen/qwen3.7-plus",
+    temperature=0.6,
+    openrouter_provider={"order": ["alibaba"], "ignore": ["google-vertex"]},
+    reasoning={"effort": "high"}
+)

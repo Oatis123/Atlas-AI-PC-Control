@@ -12,18 +12,20 @@ from agent.tools.web_tools import search_web
 from agent.tools.useful_tools import waiting
 from agent.tools.screen_tools import get_screenshot_tool
 from agent.window_interaction_agent import interact_with_window
+from agent.visual_window_agent import interact_with_window_visual
 import langchain
 import json
 
 tools = [
-         find_application_name, 
-         start_application, 
+         find_application_name,
+         start_application,
          get_open_windows,
-         execute_bash_command, 
-         waiting, 
-        #  get_screenshot_tool, 
+         execute_bash_command,
+         waiting,
+        #  get_screenshot_tool,
          search_web,
-         interact_with_window]
+         interact_with_window,
+         interact_with_window_visual]
 
 tools_by_name = {tool.name: tool for tool in tools}
 model_with_tools = laguna_s_21.bind_tools(tools)
