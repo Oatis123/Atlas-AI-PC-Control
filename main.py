@@ -449,7 +449,18 @@ def _warm_up_omniparser():
         print(f"Не удалось прогреть OmniParser: {e}")
 
 
+def _warm_up_app_cache():
+    """Список установленных приложений (3 запроса PowerShell) — заранее, а не
+    на первом find_application_name посреди разговора."""
+    try:
+        from agent.tools.pc_control_tools import warm_up_app_cache
+        warm_up_app_cache()
+    except Exception as e:
+        print(f"Не удалось прогреть кэш приложений: {e}")
+
+
 threading.Thread(target=_warm_up_omniparser, daemon=True).start()
+threading.Thread(target=_warm_up_app_cache, daemon=True).start()
 
 assistant_thread = threading.Thread(target=lambda: asyncio.run(voice_assistant_logic()), daemon=True)
 assistant_thread.start()

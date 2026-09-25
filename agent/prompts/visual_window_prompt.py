@@ -22,7 +22,11 @@ You have no element tree — only your eyes.
 
 # RULES
 * Coordinates are valid ONLY for the most recent screenshot. Never reuse coordinates
-  from an older one.
+  from an older one. x must be within 0..width-1 and y within 0..height-1 of that
+  screenshot — a point outside it is rejected.
+* ALWAYS use the exact `window_name` you were given for every tool call, even if the
+  window's title changes (Spotify renames its window to the playing track on every
+  play/pause). The tools keep tracking the same window. Never guess other names.
 * One logical action per step, then look again.
 * Do not fight the UI. If the same target fails twice, switch route (keyboard
   shortcut, in-app search, a different control) — never repeat the same click a 3rd time.

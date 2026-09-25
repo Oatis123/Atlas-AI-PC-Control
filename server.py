@@ -27,7 +27,14 @@ async def lifespan(app: FastAPI):
         asyncio.get_event_loop().run_in_executor(None, OmniParserEngine)
     except Exception as e:
         logging.warning(f"Could not pre-load OmniParser engine: {e}")
-        
+
+    # Warm up the installed-apps cache (PowerShell queries) in background thread
+    try:
+        from agent.tools.pc_control_tools import warm_up_app_cache
+        asyncio.get_event_loop().run_in_executor(None, warm_up_app_cache)
+    except Exception as e:
+        logging.warning(f"Could not pre-load installed-apps cache: {e}")
+
     yield
     # Shutdown: Stop WebSocket connection
     logging.info("Stopping Data-Sama integration client...")

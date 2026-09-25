@@ -285,11 +285,23 @@ config = {"recursion_limit": 200}
 #for chunk in graph.stream(input_data, stream_mode="values", config=config):
 #    print(chunk, end="", flush=True)
 
+def _system_message() -> SystemMessage:
+    """Системный промпт + снимок открытых окон на момент запроса: оркестратору не
+    нужен отдельный вызов get_open_windows (это целый раунд LLM, ~1 с)."""
+    try:
+        windows = get_open_windows.invoke({})
+    except Exception as e:
+        windows = f"(не удалось получить список окон: {e})"
+    return SystemMessage(
+        f"{prompt}\n# 5. OPEN WINDOWS RIGHT NOW (snapshot taken when this request arrived)\n{windows}\n"
+    )
+
+
 async def request_to_agent_async(req: List):
     logging.info(f"Получен новый запрос: {req}")
     
     try:
-        input_data = {"messages": [SystemMessage(prompt)] + req}
+        input_data = {"messages": [_system_message()] + req}
         logging.info("Данные для графа подготовлены.")
         logging.info("Вызов графа в асинхронном потоковом режиме...")
         
@@ -330,7 +342,7 @@ def request_to_agent_sync(req: List):
     import asyncio
     
     req_messages = [HumanMessage(content=c) if isinstance(c, str) else c for c in req]
-    input_data = {"messages": [SystemMessage(prompt)] + req_messages}
+    input_data = {"messages": [_system_message()] + req_messages}
     
     response = asyncio.run(graph.ainvoke(input=input_data, config=config))
     

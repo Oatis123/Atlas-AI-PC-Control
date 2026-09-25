@@ -12,7 +12,7 @@ import json
 import logging
 import time
 
-from langchain_core.messages import BaseMessage, HumanMessage, ToolMessage, SystemMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage, SystemMessage
 from langchain_core.tools import tool
 from langgraph.graph import StateGraph, END
 from typing import TypedDict
@@ -31,6 +31,8 @@ if not logging.getLogger().handlers:
         level=logging.INFO,
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     )
+
+MAX_STEPS = 12  # ходов с вызовом инструментов на одну задачу
 
 tools = [capture_window, click_window, scroll_window, simulate_keyboard, waiting]
 tools_by_name = {t.name: t for t in tools}
@@ -56,6 +58,20 @@ def _is_image_msg(m) -> bool:
 
 async def agent_node(state: AgentState) -> dict:
     logging.info("--- [Visual Agent] Вход в agent_node ---")
+
+    # Жёсткий лимит в коде: промптовое «~12 действий» модель игнорирует
+    # (было 30 вызовов LLM и 94 с на одной паузе в Spotify).
+    steps = sum(1 for m in state["messages"] if isinstance(m, AIMessage) and getattr(m, "tool_calls", None))
+    if steps >= MAX_STEPS:
+        last_result = next(
+            (m.content for m in reversed(state["messages"]) if isinstance(m, ToolMessage)), "—"
+        )
+        logging.warning(f"⚠️ [Visual Agent] Лимит шагов ({MAX_STEPS}) исчерпан — останавливаю.")
+        return {"messages": state["messages"] + [AIMessage(content=(
+            f"FAILURE: лимит в {MAX_STEPS} действий исчерпан, задача не подтверждена. "
+            f"Результат последнего действия: {_short(last_result, 300)}"
+        ))]}
+
     for msg in state["messages"]:
         if getattr(msg, "type", "") == "ai" and not getattr(msg, "content", "") and getattr(msg, "tool_calls", None):
             msg.content = "Вызываю инструменты..."

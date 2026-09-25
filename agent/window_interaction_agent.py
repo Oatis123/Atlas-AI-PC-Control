@@ -6,6 +6,7 @@ import operator
 import logging
 from agent.models.openrouter_models import *
 from agent.tools.pc_control_tools import interact_with_element_by_id, scrape_application, simulate_keyboard
+from agent.tools.vision_scrape_tool import scrape_application_vision
 from agent.tools.web_tools import search_web
 from agent.tools.useful_tools import waiting
 from agent.prompts.window_interaction_prompt import window_interaction_agent_prompt as prompt
@@ -25,7 +26,8 @@ if not logging.getLogger().handlers:
     )
 
 tools = [
-    scrape_application, 
+    scrape_application,
+    scrape_application_vision,
     interact_with_element_by_id, 
     simulate_keyboard,
     waiting,
@@ -90,7 +92,7 @@ async def agent_node(state):
 
 async def tool_node(state: AgentState) -> dict:
     logging.info("--- [Window Agent] Вход в tool_node ---")
-    tools_to_hide = ["scrape_application", "get_installed_software", "get_screenshot_tool"]
+    tools_to_hide = ["scrape_application", "scrape_application_vision", "get_installed_software", "get_screenshot_tool"]
     last_message = state["messages"][-1]
     
     is_search_web_called_now = any(tc["name"] == "search_web" for tc in last_message.tool_calls)
@@ -247,8 +249,19 @@ Returns the result of the interaction or an error message.
 
     logging.info(f"[Tool: interact_with_window] Вызов для окна '{win_name}' с задачей: '{task}'")
     try:
+        # Агент всё равно всегда начинает со scrape — делаем его сами до первого вызова
+        # LLM (экономим целый раунд). Окна нет / ошибка — отвечаем сразу, без LLM.
+        initial_scrape = await scrape_application.ainvoke({"name": win_name})
+        if not initial_scrape.lstrip().startswith("<WindowVision>"):
+            logging.info(f"[Tool: interact_with_window] Начальный scrape не удался: {initial_scrape}")
+            return f"FAILURE: {initial_scrape}"
+
         req = {"window_name": win_name, "task": task}
-        req_str = json.dumps(req, ensure_ascii=False)
+        req_str = (
+            json.dumps(req, ensure_ascii=False)
+            + "\n\nINITIAL scrape_application RESULT (already done for you — this is your first scrape):\n"
+            + initial_scrape
+        )
         response = await request_to_agent(req=req_str)
         return response
     except Exception as e:

@@ -16,33 +16,40 @@ from langchain_core.tools import tool
 
 import pyautogui
 
-from agent.tools.pc_control_tools import _get_window_by_name
+from agent.tools.pc_control_tools import _get_window_by_name, _focus_window
 
 _MAX_W = 1280
-# window name -> scale factor (native_px / shown_px) from the last capture_window
-_CAPTURE_SCALE: dict = {}
+# hwnd -> (scale, shown_w, shown_h) of the last capture_window for that window.
+# Keyed by HWND, not by name: titles change (Spotify renames its window per track).
+_CAPTURE_META: dict = {}
 
 
-def _resolve_rect(name: str):
-    """Bring the window forward and return its current screen rectangle."""
+def _resolve_window(name: str):
+    """Bring the window forward and return (hwnd, current screen rectangle)."""
     win = _get_window_by_name(name)
-    try:
-        if not win.is_active():
-            win.set_focus()
-            time.sleep(0.2)
-    except Exception:
-        pass
+    _focus_window(win)
     r = win.rectangle()
     if r.width() <= 0 or r.height() <= 0:
         raise RuntimeError(f"Окно '{name}' свернуто или имеет нулевой размер.")
-    return r
+    return win.handle, r
 
 
 def _to_screen(name: str, x, y):
-    """Map an (x, y) read off the last screenshot to absolute screen coordinates."""
-    scale = _CAPTURE_SCALE.get(name, 1.0)
-    r = _resolve_rect(name)
-    return r.left + int(float(x) * scale), r.top + int(float(y) * scale)
+    """Map an (x, y) read off the last screenshot to absolute screen coordinates.
+    Refuses points outside that screenshot: such a click lands on whatever is
+    beyond the window (e.g. the taskbar button, which minimizes the app)."""
+    hwnd, r = _resolve_window(name)
+    meta = _CAPTURE_META.get(hwnd)
+    if meta is None:
+        raise RuntimeError(f"Сначала сделай capture_window для окна '{name}'.")
+    scale, w, h = meta
+    x, y = float(x), float(y)
+    if not (0 <= x < w and 0 <= y < h):
+        raise RuntimeError(
+            f"Точка ({x:.0f}, {y:.0f}) вне скриншота {w}x{h} px. "
+            f"Бери координаты только внутри последней картинки из capture_window."
+        )
+    return r.left + int(x * scale), r.top + int(y * scale)
 
 
 @tool
@@ -55,15 +62,15 @@ def capture_window(name: str) -> dict:
     Args:
         name (str): Часть заголовка окна (например 'Spotify Premium').
     """
-    r = _resolve_rect(name)
-    img = ImageGrab.grab(bbox=(r.left, r.top, r.right, r.bottom))
+    hwnd, r = _resolve_window(name)
+    img = ImageGrab.grab(bbox=(r.left, r.top, r.right, r.bottom), all_screens=True)
     native_w, native_h = img.size
 
     scale = 1.0
     if native_w > _MAX_W:
         scale = native_w / _MAX_W
         img = img.resize((_MAX_W, int(native_h / scale)), Image.Resampling.LANCZOS)
-    _CAPTURE_SCALE[name] = scale
+    _CAPTURE_META[hwnd] = (scale, img.size[0], img.size[1])
 
     buf = BytesIO()
     img.save(buf, format="JPEG", quality=85, optimize=True)

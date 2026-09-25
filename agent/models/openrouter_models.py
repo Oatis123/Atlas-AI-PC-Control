@@ -62,3 +62,22 @@ vlm_vision = ChatOpenRouter(
     openrouter_provider={"order": ["alibaba"], "ignore": ["google-vertex"]},
     reasoning={"effort": "high"}
 )
+
+# ============================================================================
+# >>> СЮДА ВСТАВЬ VISION-LLM ДЛЯ ИНСТРУМЕНТА scrape_application_vision <<<
+# Модель получает скриншот окна (сообщением от пользователя) и возвращает список
+# UI-элементов с координатами. Нужна только поддержка картинок, tool-calling не нужен.
+# Пример:
+#   vision_scraper = ChatOpenRouter(
+#       model="<vendor>/<vision-model>",
+#       temperature=0,
+#       openrouter_provider={"sort": "latency"},
+#   )
+# Пока None — инструмент вернёт агенту понятную ошибку, всё остальное работает как раньше.
+vision_scraper = ChatOpenRouter(
+    model="qwen/qwen3.7-plus",
+    temperature=0.6,
+    openrouter_provider={"order": ["alibaba"], "ignore": ["google-vertex"]},
+    reasoning={"effort": "none"}
+)
+# ============================================================================

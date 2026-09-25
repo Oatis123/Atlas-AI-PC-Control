@@ -6,6 +6,8 @@ import time
 import ctypes
 import logging
 import re
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from typing import List, Dict, Any, Union, Optional
 
 from langchain_core.tools import tool
@@ -23,6 +25,9 @@ from PIL import ImageGrab
 
 import pyautogui
 import pyperclip
+
+# По умолчанию pyautogui спит 0.1с после КАЖДОГО вызова (press/click/moveTo...).
+pyautogui.PAUSE = 0.02
 
 ELEMENTS_CACHE = {}
 CURRENT_ID = 0
@@ -54,16 +59,52 @@ def _decamel(text: str) -> str:
     return spaced.strip()
 
 
+_SOFTWARE_CACHE_TTL = 1800  # установленные программы меняются редко
+_SOFTWARE_CACHE_LOCK = threading.Lock()
+
+
+def _run_powershell(command: str):
+    return subprocess.run(["powershell", "-NoProfile", "-Command", command],
+                          capture_output=True, text=True, encoding='utf-8', errors='ignore')
+
+
+def warm_up_app_cache():
+    """Заполняет кэш установленных приложений заранее (зовётся при старте системы),
+    чтобы первый find_application_name не ждал PowerShell."""
+    t0 = time.time()
+    _get_installed_software()
+    logging.info(f"Кэш приложений прогрет за {time.time() - t0:.2f}с.")
+
+
 def _get_installed_software():
+    # Лок: фоновый прогрев и первый реальный вызов не должны гонять PowerShell дважды.
+    with _SOFTWARE_CACHE_LOCK:
+        return _get_installed_software_locked()
+
+
+def _get_installed_software_locked():
     global _SOFTWARE_CACHE, _SOFTWARE_CACHE_TIME, _MODERN_APPS_CACHE, _STARTAPPS_CACHE
-    if _SOFTWARE_CACHE is not None and (time.time() - _SOFTWARE_CACHE_TIME < 300):
+    if _SOFTWARE_CACHE is not None and (time.time() - _SOFTWARE_CACHE_TIME < _SOFTWARE_CACHE_TTL):
         return _SOFTWARE_CACHE
 
     all_apps = set()
 
-    # 1. Start-menu apps: friendly names + launchable AppIDs (Win32 shortcuts + UWP).
     command_startapps = r'Get-StartApps | ForEach-Object { "$($_.Name)|$($_.AppID)" }'
-    result_startapps = subprocess.run(["powershell", "-Command", command_startapps], capture_output=True, text=True, encoding='utf-8', errors='ignore')
+    command_classic = r'''
+    Get-ItemProperty HKLM:\Software\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*,
+                     HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*,
+                     HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\* |
+    Where-Object {$_.PSObject.Properties['DisplayName'] -and $_.DisplayName -ne $null} |
+    Select-Object -ExpandProperty DisplayName
+    '''
+    command_modern = r'Get-AppxPackage | ForEach-Object { "$($_.Name)|$($_.PackageFamilyName)" }'
+
+    # Три независимых PowerShell-запроса — параллельно, а не друг за другом.
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        result_startapps, result_classic, result_modern = pool.map(
+            _run_powershell, (command_startapps, command_classic, command_modern))
+
+    # 1. Start-menu apps: friendly names + launchable AppIDs (Win32 shortcuts + UWP).
     if result_startapps.returncode == 0:
         for line in result_startapps.stdout.splitlines():
             line = line.strip()
@@ -75,24 +116,11 @@ def _get_installed_software():
                     all_apps.add(name)
 
     # 2. Classic installed programs (registry Uninstall DisplayName).
-    command_classic = r'''
-    Get-ItemProperty HKLM:\Software\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*,
-                     HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*,
-                     HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\* |
-    Where-Object {$_.PSObject.Properties['DisplayName'] -and $_.DisplayName -ne $null} |
-    Select-Object -ExpandProperty DisplayName
-    '''
-
-    result_classic = subprocess.run(["powershell", "-Command", command_classic], capture_output=True, text=True, encoding='utf-8', errors='ignore')
-
     if result_classic.returncode == 0:
         classic_apps = {line.strip() for line in result_classic.stdout.splitlines() if line.strip()}
         all_apps.update(classic_apps)
 
     # 3. UWP packages: keep PFN map for launching; add de-camelCased names as a fallback.
-    command_modern = r'Get-AppxPackage | ForEach-Object { "$($_.Name)|$($_.PackageFamilyName)" }'
-    result_modern = subprocess.run(["powershell", "-Command", command_modern], capture_output=True, text=True, encoding='utf-8', errors='ignore')
-
     if result_modern.returncode == 0:
         for line in result_modern.stdout.splitlines():
             line = line.strip()
@@ -229,7 +257,8 @@ def _best_key(mapping, term: str):
     return best
 
 
-def _start_application_by_name(app_name: str) -> bool:
+def _launch_application(app_name: str) -> bool:
+    """Отправляет команду запуска. True — если нашёлся способ запустить."""
     term = app_name.strip().lower()
 
     if not _STARTAPPS_CACHE or not _MODERN_APPS_CACHE:
@@ -241,7 +270,6 @@ def _start_application_by_name(app_name: str) -> bool:
         if key:
             app_id = _STARTAPPS_CACHE[key]
             subprocess.Popen(f'explorer.exe shell:AppsFolder\\{app_id}', shell=True)
-            time.sleep(2.0)
             return True
     except Exception as e:
         logging.warning(f"Start-menu launch failed for '{app_name}': {e}")
@@ -251,7 +279,6 @@ def _start_application_by_name(app_name: str) -> bool:
         key = _best_key(_get_classic_app_paths(), term)
         if key:
             subprocess.Popen(shlex.split(f'"{_get_classic_app_paths()[key]}"'))
-            time.sleep(2.0)
             return True
     except Exception as e:
         logging.warning(f"Registry-path launch failed for '{app_name}': {e}")
@@ -261,57 +288,204 @@ def _start_application_by_name(app_name: str) -> bool:
         key = _best_key(_MODERN_APPS_CACHE, term)
         if key:
             subprocess.Popen(f'explorer.exe shell:appsFolder\\{_MODERN_APPS_CACHE[key]}!App', shell=True)
-            time.sleep(2.0)
             return True
     except Exception as e:
         logging.warning(f"UWP launch failed for '{app_name}': {e}")
 
-    logging.error(f"Could not find/launch application: '{app_name}'")
     return False
 
 
+def _wait_for_app_window(before: set, fg_before, timeout: float = 8.0):
+    """Ждёт окно запущенного приложения вместо слепого sleep. Сигналы: появилось новое
+    видимое окно с заголовком, либо на передний план вышло другое окно (single-instance
+    приложение вроде Spotify активирует уже открытое). Возвращает заголовок или None."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        time.sleep(0.15)
+        new = [hwnd for hwnd, _ in _visible_windows() if hwnd not in before]
+        fg = _user32.GetForegroundWindow()
+        hwnd = new[0] if new else (fg if fg and fg != fg_before and _window_title(fg) else None)
+        if hwnd:
+            time.sleep(0.3)  # дать окну дорисоваться и выставить финальный заголовок
+            return _window_title(hwnd) or None
+    return None
+
+
+def _start_application_by_name(app_name: str) -> str:
+    before = {hwnd for hwnd, _ in _visible_windows()}
+    fg_before = _user32.GetForegroundWindow()
+
+    if not _launch_application(app_name):
+        logging.error(f"Could not find/launch application: '{app_name}'")
+        return f"Ошибка: не удалось найти способ запустить приложение '{app_name}'."
+
+    t0 = time.time()
+    title = _wait_for_app_window(before, fg_before)
+    logging.info(f"start_application '{app_name}': окно {title!r} за {time.time() - t0:.2f}с")
+    if title:
+        return f"Приложение запущено. Заголовок окна: '{title}'"
+    return (f"Команда запуска '{app_name}' отправлена, но окно не появилось за 8 с. "
+            f"Проверь get_open_windows.")
+
+
 @tool
-def start_application(app_name: str)->bool:
-    """Запускает приложение по его точному названию. Используйте `find_application_name`, чтобы найти его. Возвращает True при успехе."""
+def start_application(app_name: str) -> str:
+    """Запускает приложение по его точному названию (найди его через `find_application_name`).
+    Ждёт появления окна и возвращает его точный заголовок — используй его как win_name
+    для делегирования, отдельный get_open_windows после запуска не нужен."""
     return _start_application_by_name(app_name=app_name)
+
+
+_user32 = ctypes.windll.user32
+_EnumWindowsProc = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+_HWND_CACHE = {}  # requested window name -> hwnd
+
+
+def _window_title(hwnd) -> str:
+    length = _user32.GetWindowTextLengthW(hwnd)
+    if length <= 0:
+        return ""
+    buff = ctypes.create_unicode_buffer(length + 1)
+    _user32.GetWindowTextW(hwnd, buff, length + 1)
+    return buff.value
+
+
+def _visible_windows():
+    """[(hwnd, title)] видимых окон верхнего уровня с заголовком, в z-порядке (верхнее первым)."""
+    out = []
+
+    def foreach_window(hwnd, _):
+        if _user32.IsWindowVisible(hwnd):
+            title = _window_title(hwnd)
+            if title:
+                out.append((hwnd, title))
+        return True
+
+    _user32.EnumWindows(_EnumWindowsProc(foreach_window), 0)
+    return out
+
+
+_EXE_SUFFIX_RE = re.compile(r"\s*\[[^\[\]]+\.exe\]\s*$", re.IGNORECASE)
+
+
+def _process_name(hwnd) -> str:
+    """Имя exe-файла процесса, которому принадлежит окно (например 'Spotify.exe')."""
+    pid = ctypes.c_ulong()
+    _user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    try:
+        return psutil.Process(pid.value).name()
+    except Exception:
+        return ""
 
 
 @tool
 def get_open_windows():
-    """Возвращает список заголовков всех открытых окон."""
-    EnumWindows = ctypes.windll.user32.EnumWindows
-    EnumWindowsProc = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int))
-    GetWindowText = ctypes.windll.user32.GetWindowTextW
-    GetWindowTextLength = ctypes.windll.user32.GetWindowTextLengthW
-    IsWindowVisible = ctypes.windll.user32.IsWindowVisible
-    
-    window_titles = []
-    def foreach_window(hwnd, lParam):
-        if IsWindowVisible(hwnd):
-            length = GetWindowTextLength(hwnd)
-            if length > 0:
-                buff = ctypes.create_unicode_buffer(length + 1)
-                GetWindowText(hwnd, buff, length + 1)
-                title = buff.value
-                if title:
-                    window_titles.append(title)
-        return True
-        
-    EnumWindows(EnumWindowsProc(foreach_window), 0)
-    
-    if not window_titles:
+    """Возвращает список открытых окон в формате `Заголовок  [процесс.exe]`.
+    Процесс помогает узнать приложение, у которого заголовок меняется (например, Spotify
+    во время воспроизведения показывает в заголовке играющий трек).
+    В win_name передавай только заголовок, без `[процесс.exe]`."""
+    lines = []
+    for hwnd, title in _visible_windows():
+        exe = _process_name(hwnd)
+        lines.append(f"{title}  [{exe}]" if exe else title)
+    if not lines:
         return "не найдено открытых окон"
-    
-    return "\n".join(window_titles)
+    return "\n".join(lines)
 
-def _get_window_by_name(name: str):
-    """Вспомогательная функция для получения объекта окна по имени через pywinauto."""
+
+def _find_hwnd(name: str):
+    """HWND окна по имени: точное совпадение заголовка, иначе первое (верхнее) окно,
+    чей заголовок содержит имя приложения, иначе окно процесса с таким именем
+    ('Spotify' -> Spotify.exe). Прямой EnumWindows — ~1 мс против ~2 с у pywinauto
+    `title_re`, который на каждый вызов дважды перебирает все окна."""
+    name = _EXE_SUFFIX_RE.sub("", name).strip()  # на случай, если передали строку из get_open_windows
     app_name = name.split(" - ")[-1].strip() if " - " in name else name.strip()
-    safe_name = re.escape(app_name)
-    main_win_spec = Desktop(backend="win32").window(title_re=f".*{safe_name}.*", found_index=0)
-    if not main_win_spec.exists(timeout=0.5):
-        raise ElementNotFoundError(f"Окно '{name}' не найдено.")
-    return main_win_spec.wrapper_object()
+
+    # Однажды найденное окно держим по HWND, пока оно живо, даже если заголовок
+    # сменился: Spotify переименовывает окно по треку при каждом play/pause.
+    cached = _HWND_CACHE.get(name)
+    if cached and _user32.IsWindow(cached) and _user32.IsWindowVisible(cached):
+        return cached
+
+    windows = _visible_windows()
+    found = None
+    for hwnd, title in windows:
+        if title == name:
+            found = hwnd
+            break
+        if found is None and app_name in title:
+            found = hwnd
+
+    if found is None:
+        key = app_name.lower()
+        for hwnd, _ in windows:
+            exe_base = _process_name(hwnd).lower().removesuffix(".exe")
+            if exe_base and (exe_base == key or exe_base in key.split()):
+                found = hwnd
+                break
+
+    if found:
+        _HWND_CACHE[name] = found
+    return found
+
+
+def _get_window_by_name(name: str, timeout: float = 0.5):
+    """Вспомогательная функция для получения объекта окна по имени через pywinauto."""
+    deadline = time.time() + timeout
+    while True:
+        hwnd = _find_hwnd(name)
+        if hwnd:
+            return Desktop(backend="win32").window(handle=hwnd).wrapper_object()
+        if time.time() >= deadline:
+            raise ElementNotFoundError(f"Окно '{name}' не найдено.")
+        time.sleep(0.1)
+
+
+def _focus_window(win, settle: float = 0.3) -> bool:
+    """Выводит окно на передний план. Пауза `settle` — только если фокус реально
+    пришлось переключать. Возвращает True, если фокус переключался."""
+    try:
+        if _user32.GetForegroundWindow() == win.handle:
+            return False
+        win.set_focus()
+    except Exception:
+        return False
+    time.sleep(settle)
+    return True
+
+def _register_elements(elements, rect) -> str:
+    """Кладёт распознанные элементы в ELEMENTS_CACHE (абсолютные экранные координаты,
+    по ним кликает interact_with_element_by_id) и возвращает XML <WindowVision>.
+
+    elements: [{"left","top","right","bottom" (px относительно окна), "name", "control_type"}]
+    rect: прямоугольник окна на экране (pywinauto .rectangle()).
+    Общий для scrape_application (OmniParser) и scrape_application_vision (VLM)."""
+    global CURRENT_ID
+    ELEMENTS_CACHE.clear()
+    CURRENT_ID = 0
+
+    xml_lines = ["<WindowVision>"]
+    for elem in elements:
+        elem_id = CURRENT_ID
+        # Map window-relative coordinates to absolute screen coordinates
+        ELEMENTS_CACHE[elem_id] = {
+            "left": rect.left + elem["left"], "top": rect.top + elem["top"],
+            "right": rect.left + elem["right"], "bottom": rect.top + elem["bottom"],
+            "name": elem["name"],
+            "control_type": elem["control_type"]
+        }
+        CURRENT_ID += 1
+
+        safe_name = elem["name"].replace('"', '&quot;').replace('<', '&lt;').replace('>', '&gt;')
+        tag = elem["control_type"].replace("/", "_")
+        # Include spatial coordinates hint so LLM understands layout (row/column position)
+        rel_cx = (elem["left"] + elem["right"]) // 2
+        rel_cy = (elem["top"] + elem["bottom"]) // 2
+        xml_lines.append(f'  <{tag} id="{elem_id}" name="{safe_name}" pos="x:{rel_cx},y:{rel_cy}" />')
+
+    xml_lines.append("</WindowVision>")
+    return "\n".join(xml_lines)
+
 
 @tool
 def scrape_application(name: str) -> str:
@@ -332,24 +506,16 @@ def scrape_application(name: str) -> str:
 
     try:
         app_name = name.split(" - ")[-1].strip() if " - " in name else name.strip()
-        safe_name = re.escape(app_name)
-        
-        main_win_spec = Desktop(backend="win32").window(title_re=f".*{safe_name}.*", found_index=0)
-        if not main_win_spec.exists(timeout=0.5):
-            main_win_spec = Desktop(backend="uia").window(title_re=f".*{safe_name}.*", found_index=0)
-            if not main_win_spec.exists(timeout=0.5):
-                elapsed = time.time() - start_time
-                logging.info(f"❌ [OmniParser] Окно '{name}' не найдено ({elapsed:.4f} сек).")
-                return f"Ошибка: Окно с именем, содержащим '{name}', не найдено."
 
-        main_win = main_win_spec.wrapper_object()
+        try:
+            main_win = _get_window_by_name(name)
+        except ElementNotFoundError:
+            elapsed = time.time() - start_time
+            logging.info(f"❌ [OmniParser] Окно '{name}' не найдено ({elapsed:.4f} сек).")
+            return f"Ошибка: Окно с именем, содержащим '{name}', не найдено."
 
-        if not main_win.is_active():
+        if _focus_window(main_win):
             logging.info(f"↗️ [OmniParser] Фокусировка на окне '{app_name}'...")
-            try:
-                main_win.set_focus()
-            except Exception:
-                pass
 
         rect = main_win.rectangle()
         if rect.width() <= 0 or rect.height() <= 0:
@@ -359,7 +525,7 @@ def scrape_application(name: str) -> str:
         # Capture window screenshot
         bbox = (rect.left, rect.top, rect.right, rect.bottom)
         logging.info(f"📸 [OmniParser] Захват скриншота области окна: X={rect.left}, Y={rect.top}, W={rect.width()}, H={rect.height()}...")
-        img = ImageGrab.grab(bbox=bbox)
+        img = ImageGrab.grab(bbox=bbox, all_screens=True)  # иначе окна на других мониторах выходят чёрными
 
         # Parse screenshot with OmniParser engine
         logging.info(f"🧠 [OmniParser] Запуск распознавания элементов (YOLO + OCR)...")
@@ -371,32 +537,7 @@ def scrape_application(name: str) -> str:
             logging.warning(f"⚠️ [OmniParser] Элементы не найдены на скриншоте '{app_name}'.")
             return "OmniParser не обнаружил интерактивных элементов на скриншоте окна."
 
-        xml_lines = ["<WindowVision>"]
-        for elem in elements:
-            elem_id = CURRENT_ID
-            # Map window-relative coordinates to absolute screen coordinates
-            abs_left = rect.left + elem["left"]
-            abs_top = rect.top + elem["top"]
-            abs_right = rect.left + elem["right"]
-            abs_bottom = rect.top + elem["bottom"]
-
-            ELEMENTS_CACHE[elem_id] = {
-                "left": abs_left, "top": abs_top,
-                "right": abs_right, "bottom": abs_bottom,
-                "name": elem["name"],
-                "control_type": elem["control_type"]
-            }
-            CURRENT_ID += 1
-
-            safe_name = elem["name"].replace('"', '&quot;').replace('<', '&lt;').replace('>', '&gt;')
-            tag = elem["control_type"].replace("/", "_")
-            # Include spatial coordinates hint so LLM understands layout (row/column position)
-            rel_cx = (elem["left"] + elem["right"]) // 2
-            rel_cy = (elem["top"] + elem["bottom"]) // 2
-            xml_lines.append(f'  <{tag} id="{elem_id}" name="{safe_name}" pos="x:{rel_cx},y:{rel_cy}" />')
-
-        xml_lines.append("</WindowVision>")
-        xml_output = "\n".join(xml_lines)
+        xml_output = _register_elements(elements, rect)
 
         elapsed = time.time() - start_time
         logging.info(f"⏱️ [OmniParser] Окно '{name}' успешно распознано за {elapsed:.4f} сек. Найдено {CURRENT_ID} элементов!")
@@ -541,8 +682,8 @@ def simulate_keyboard(name: str, keys: str) -> str:
     """
     try:
         main_win = _get_window_by_name(name)
-        main_win.set_focus()
-        time.sleep(0.4)  # Даем окну время реально получить фокус (0.2 не хватало — терялся первый символ)
+        # 0.4с — если фокус переключался (0.2 не хватало — терялся первый символ)
+        _focus_window(main_win, settle=0.4)
 
         _MODIFIERS = {
             'ctrl', 'control', 'alt', 'altleft', 'altright', 'shift', 'shiftleft',
