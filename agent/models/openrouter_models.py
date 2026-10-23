@@ -21,6 +21,13 @@ deepseek_v4_pro = ChatOpenRouter(
     reasoning={"effort": "high"}
 )
 
+deepseek_v41_flash = ChatOpenRouter(
+    model="deepseek/deepseek-v4.1-flash",
+    temperature=1.0,
+    openrouter_provider={"sort": "latency", "ignore": ["google-vertex"]},
+    reasoning={"effort": "none"}
+)
+
 gemma4_31b = ChatOpenRouter(
     model="google/gemma-4-31b-it",
     temperature=0.6,
@@ -54,4 +61,17 @@ laguna_s_21 = ChatOpenRouter(
     temperature=0.7,
     openrouter_provider={"sort": "latency"},
     reasoning={"effort": "none"}
+)
+
+haiku_55 = ChatOpenRouter(
+    model="anthropic/claude-haiku-5.5",
+    openrouter_provider={"sort": "latency"},
+    reasoning={"effort": "low"}
+)
+
+vlm_vision = ChatOpenRouter(
+    model="qwen/qwen3.7-plus",
+    temperature=0.6,
+    openrouter_provider={"order": ["alibaba"], "ignore": ["google-vertex"]},
+    reasoning={"effort": "high"}
 )

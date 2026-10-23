@@ -5,6 +5,7 @@ import websockets
 
 logger = logging.getLogger("DataSamaClient")
 
+
 class DataSamaClient:
     def __init__(
         self,
@@ -40,7 +41,7 @@ class DataSamaClient:
                     self.websocket = ws
                     logger.info("Connected to Data-Sama WebSocket.")
                     await self._send_init()
-                    
+
                     # Keep reading incoming messages if any
                     async for message in ws:
                         logger.info(f"Received message from Data-Sama: {message}")
@@ -48,7 +49,9 @@ class DataSamaClient:
                 self.websocket = None
                 if not self._running:
                     break
-                logger.warning(f"WebSocket connection lost ({e}). Retrying in 5 seconds...")
+                logger.warning(
+                    f"WebSocket connection lost ({e}). Retrying in 5 seconds..."
+                )
                 await asyncio.sleep(5)
 
     async def _send_json(self, payload: dict):
@@ -60,8 +63,10 @@ class DataSamaClient:
             except Exception as e:
                 logger.error(f"Failed to send WS message: {e}")
                 raise
-        else:
-            logger.warning("Cannot send WS message: WebSocket is disconnected.")
+            else:
+                logger.warning(
+                    "Cannot send WS message: WebSocket is disconnected."
+                )
 
     async def _send_init(self):
         init_payload = {
@@ -70,21 +75,21 @@ class DataSamaClient:
                 "integration_name": self.integration_name,
                 "rest_url": self.rest_url,
                 "system_instructions": (
-                    "Используй этот плагин для выполнения любых автономных задач на ПК пользователя "
-                    "(запуск программ, управление окнами, поиск файлов, выполнение консольных команд bash, клики)."
+                    "Use this plugin to execute any autonomous tasks on the user's PC "
+                    "(launching programs, window management, searching files, running bash console commands, clicking)."
                 ),
                 "tools": [
                     {
                         "name": "execute_pc_task",
                         "type": "async",
                         "path": "/tools/run-pc-agent",
-                        "description": "Поручить автономному агенту управления ПК выполнить задание на компьютере.",
+                        "description": "Instruct the autonomous PC control agent to perform a task on the computer.",
                         "parameters": {
                             "prompt": "string"
-                        }
+                        },
                     }
-                ]
-            }
+                ],
+            },
         }
         await self._send_json(init_payload)
 
@@ -94,8 +99,8 @@ class DataSamaClient:
             "integration_name": self.integration_name,
             "data": {
                 "update_type": "background",
-                "payload": payload_text
-            }
+                "payload": payload_text,
+            },
         }
         await self._send_json(event_data)
 
@@ -106,7 +111,7 @@ class DataSamaClient:
             "tool_name": tool_name,
             "data": {
                 "status": status,
-                "output": str(output)
-            }
+                "output": str(output),
+            },
         }
         await self._send_json(event_data)

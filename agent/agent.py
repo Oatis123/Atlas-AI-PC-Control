@@ -11,32 +11,33 @@ from agent.tools.pc_control_tools import *
 from agent.tools.web_tools import search_web
 from agent.tools.useful_tools import waiting
 from agent.tools.screen_tools import get_screenshot_tool
-from agent.window_interaction_agent import interact_with_window
+from agent.window_agent import interact_with_window
 import langchain
+import asyncio
 import json
 
 tools = [
-         find_application_name, 
-         start_application, 
+         find_application_name,
+         start_application,
          get_open_windows,
-         execute_bash_command, 
-         waiting, 
-        #  get_screenshot_tool, 
+         execute_bash_command,
+         waiting,
+        #  get_screenshot_tool,
          search_web,
          interact_with_window]
 
 tools_by_name = {tool.name: tool for tool in tools}
-model_with_tools = gemma4_31b.bind_tools(tools)
+model_with_tools = deepseek_v41_flash.bind_tools(tools)
 
 
-logging.basicConfig(
-    level=logging.INFO,
-    handlers=[
-        logging.FileHandler('agent_logs.txt', mode='a', encoding='utf-8'),
-        logging.StreamHandler()
-    ],
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
+# Logging is configured once by utils.logging_setup.setup_logging() at process
+# start (see main.py / server.py). Fall back to a basic console config only when
+# this module is imported standalone.
+if not logging.getLogger().handlers:
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
 
 
 class AgentState(TypedDict):
@@ -45,9 +46,81 @@ class AgentState(TypedDict):
     screenshot_ids_to_hide: Annotated[list[str], operator.add]
     last_search_web_id: str | None
 
- 
+
+def _short(text, limit: int = 800) -> str:
+    """One-line, length-capped preview of a value for log output."""
+    s = str(text).replace("\n", " ⏎ ")
+    return s if len(s) <= limit else f"{s[:limit]}… (+{len(s) - limit} символов)"
+
+
+def _fmt_msg(m) -> str:
+    """Compact one-line render of a single message (no system prompt, no reasoning dump)."""
+    kind = type(m).__name__
+    tool_calls = getattr(m, "tool_calls", None) or []
+    if tool_calls:
+        calls = "; ".join(f"{tc['name']}({tc.get('args', {})})" for tc in tool_calls)
+        return f"{kind} → {calls}"
+    if isinstance(m, ToolMessage):
+        tag = getattr(m, "name", "") or getattr(m, "tool_call_id", "")
+        return f"ToolMessage[{tag}]: {_short(m.content)}"
+    return f"{kind}: {_short(getattr(m, 'content', ''))}"
+
+
+def _summarize_chunk(chunk) -> str:
+    """Log only the last message produced by each node this step, not the whole history."""
+    parts = []
+    for node, payload in chunk.items():
+        msgs = payload.get("messages") if isinstance(payload, dict) else None
+        parts.append(f"[{node}] {_fmt_msg(msgs[-1])}" if msgs else f"[{node}]")
+    return " | ".join(parts)
+
+
+def _detect_stuck_loop(messages, threshold=3):
+    """Возвращает сигнатуру повторяющегося вызова, если последние `threshold`
+    вызовов инструментов идентичны и каждый вернул ошибку, иначе None."""
+    sigs = []
+    i = len(messages) - 1
+    while i >= 0 and len(sigs) < threshold:
+        msg = messages[i]
+        if isinstance(msg, AIMessage) and getattr(msg, "tool_calls", None):
+            errored = False
+            for j in range(i + 1, len(messages)):
+                nxt = messages[j]
+                if isinstance(nxt, AIMessage):
+                    break
+                if isinstance(nxt, ToolMessage) and (
+                    "шибка" in str(nxt.content) or "rror" in str(nxt.content)
+                ):
+                    errored = True
+            sig = json.dumps(
+                [(tc["name"], tc.get("args", {})) for tc in msg.tool_calls],
+                sort_keys=True, ensure_ascii=False,
+            )
+            sigs.append((sig, errored))
+        i -= 1
+
+    if len(sigs) < threshold:
+        return None
+    first = sigs[0][0]
+    if all(sig == first and errored for sig, errored in sigs):
+        return first
+    return None
+
+
 async def agent_node(state):
     logging.info("--- Вход в agent_node ---")
+
+    stuck_signature = _detect_stuck_loop(state["messages"])
+    if stuck_signature:
+        logging.warning(
+            f"⚠️ [LOOP GUARD] Инструмент повторно вызывается с теми же аргументами и "
+            f"возвращает ошибку: {stuck_signature}. Прерываю цикл."
+        )
+        return {"messages": state["messages"] + [AIMessage(content=(
+            "Failed. Не удалось выполнить задачу: инструмент несколько раз подряд "
+            "вызван с одними и теми же неверными аргументами и вернул ошибку."
+        ))]}
+
     # 1. Заглушка для пустого контента (чтобы Xiaomi не крашился)
     for msg in state["messages"]:
         if getattr(msg, "type", "") == "ai" and not getattr(msg, "content", "") and getattr(msg, "tool_calls", None):
@@ -80,7 +153,7 @@ async def agent_node(state):
 
 async def tool_node(state: AgentState) -> dict:
     logging.info("--- Вход в tool_node ---")
-    tools_to_hide = ["scrape_application", "get_installed_software", "get_screenshot_tool"]
+    tools_to_hide = ["get_installed_software", "get_screenshot_tool"]
     last_message = state["messages"][-1]
     
     is_search_web_called_now = any(tc["name"] == "search_web" for tc in last_message.tool_calls)
@@ -156,6 +229,7 @@ async def tool_node(state: AgentState) -> dict:
                 observation = await tool.ainvoke(tool_call["args"])
                 elapsed = time.time() - tool_start_time
                 logging.info(f"⏱️ [TOOL TIME] Инструмент '{tool_call['name']}' выполнен за {elapsed:.4f} сек.")
+                logging.info(f"Результат '{tool_call['name']}': {_short(observation)}")
                 new_tool_results.append(ToolMessage(content=str(observation), tool_call_id=tool_call["id"]))
         except Exception as tool_err:
             logging.error(f"Ошибка вызова инструмента {tool_call['name']}: {tool_err}")
@@ -210,11 +284,23 @@ config = {"recursion_limit": 200}
 #for chunk in graph.stream(input_data, stream_mode="values", config=config):
 #    print(chunk, end="", flush=True)
 
+def _system_message() -> SystemMessage:
+    """Системный промпт + снимок открытых окон на момент запроса: оркестратору не
+    нужен отдельный вызов get_open_windows (это целый раунд LLM, ~1 с)."""
+    try:
+        windows = get_open_windows.invoke({})
+    except Exception as e:
+        windows = f"(не удалось получить список окон: {e})"
+    return SystemMessage(
+        f"{prompt}\n# 5. OPEN WINDOWS RIGHT NOW (snapshot taken when this request arrived)\n{windows}\n"
+    )
+
+
 async def request_to_agent_async(req: List):
     logging.info(f"Получен новый запрос: {req}")
     
     try:
-        input_data = {"messages": [SystemMessage(prompt)] + req}
+        input_data = {"messages": [_system_message()] + req}
         logging.info("Данные для графа подготовлены.")
         logging.info("Вызов графа в асинхронном потоковом режиме...")
         
@@ -223,7 +309,7 @@ async def request_to_agent_async(req: List):
 
         async for chunk in graph.astream(input_data, config={"recursion_limit": 200}):
             if "__end__" not in chunk:
-                logging.info(f"Промежуточный шаг графа: {chunk}")
+                logging.info(f"Шаг графа: {_summarize_chunk(chunk)}")
             
             last_chunk = chunk
 
@@ -234,15 +320,13 @@ async def request_to_agent_async(req: List):
 
         if final_answer:
             answer = final_answer.get("messages")
-            logging.info("Ответ успешно извлечен из финального узла.")
-            logging.info(answer)
+            logging.info(f"Ответ извлечён из финального узла: {_fmt_msg(answer[-1]) if answer else None}")
             return answer
         elif last_chunk and "agent" in last_chunk:
             agent_messages = last_chunk["agent"].get("messages", [])
             if agent_messages and isinstance(agent_messages[-1], AIMessage):
                 answer = [agent_messages[-1]]
-                logging.info("Извлечен прямой текстовый ответ от агента.")
-                logging.info(answer)
+                logging.info(f"Прямой текстовый ответ агента: {_fmt_msg(answer[-1])}")
                 return answer
         else:
             logging.warning("Граф завершил работу, но не вернул никакого ответа.")
@@ -257,7 +341,7 @@ def request_to_agent_sync(req: List):
     import asyncio
     
     req_messages = [HumanMessage(content=c) if isinstance(c, str) else c for c in req]
-    input_data = {"messages": [SystemMessage(prompt)] + req_messages}
+    input_data = {"messages": [_system_message()] + req_messages}
     
     response = asyncio.run(graph.ainvoke(input=input_data, config=config))
     
