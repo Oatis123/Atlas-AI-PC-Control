@@ -49,11 +49,14 @@ INPUT_FORMAT = pyaudio.paInt16
 VAD_AGGRESSIVENESS = 3
 VAD_FRAME_MS = 30
 VAD_CHUNK_SIZE = int(INPUT_SAMPLE_RATE * (VAD_FRAME_MS / 1000.0))
-VAD_SILENCE_TIMEOUT_MS = 1500
+VAD_SILENCE_TIMEOUT_MS = 700
 VAD_PRE_BUFFER_MS = 300
+WAKE_BLOCK_SIZE = 1024  # ~64 мс на блок вместо 4096 (256 мс): быстрее реакция на кодовое слово
+WAKE_PARTIAL_HOLD_S = 0.35  # «атлас» в partial без продолжения дольше этого = только кодовое слово
+QUICK_COMMAND_COOLDOWN_S = 0.8
 MAX_RETRIES = 20
 RETRY_DELAY_SECONDS = 2
-FOLLOW_UP_TIMEOUT_SECONDS = 5
+FOLLOW_UP_TIMEOUT_SECONDS = 3
 
 chat_history = []
 gui_queue = queue.Queue()
@@ -78,10 +81,14 @@ if TTS_ENGINE == 'gtts':
 elif TTS_ENGINE == 'silero':
     print("Загрузка модели Silero TTS...")
     device = torch.device('cuda')
+    # Silero — TorchScript: JIT-оптимизатор перекомпилирует граф на первых вызовах с новой
+    # длиной текста (1–4 с на вызов). Без него вызов стабильно ~0.05 с.
+    torch._C._set_graph_executor_optimize(False)
     try:
         local_file = ensure_silero_model()
         silero_model = torch.package.PackageImporter(local_file).load_pickle("tts_models", "model")
         silero_model.to(device)
+        silero_model.apply_tts(text="Привет.", speaker=silero_speaker, sample_rate=silero_sample_rate)  # прогрев CUDA
         print("Модель Silero TTS успешно загружена.")
     except Exception as e:
         print(f"Ошибка при загрузке Silero TTS: {e}")
@@ -144,23 +151,40 @@ def _sanitize_for_tts(text):
 def speak_silero(text):
     text = _sanitize_for_tts(text)
     try:
+        # Синтез следующего предложения идёт в фоне, пока проигрывается текущее —
+        # иначе между предложениями слышна пауза на apply_tts.
+        audio_q = queue.Queue()
+
+        def _synthesize():
+            try:
+                for sent in sentence_chunks(text):
+                    if not sent.strip():
+                        continue
+                    try:
+                        audio = silero_model.apply_tts(text=sent,
+                                                       speaker=silero_speaker,
+                                                       sample_rate=silero_sample_rate)
+                    except Exception as chunk_err:
+                        print(f"Silero пропустил фрагмент ({chunk_err!r}): {sent!r}")
+                        continue
+                    audio_q.put((audio.numpy() * 32767).astype(np.int16).tobytes())
+            finally:
+                audio_q.put(None)
+
+        threading.Thread(target=_synthesize, daemon=True).start()
+
         out = pa.open(format=pyaudio.paInt16, channels=1, rate=silero_sample_rate, output=True)
         spoke_any = False
-        for sent in sentence_chunks(text):
-            if not sent.strip():
-                continue
-            try:
-                audio = silero_model.apply_tts(text=sent,
-                                               speaker=silero_speaker,
-                                               sample_rate=silero_sample_rate)
-            except Exception as chunk_err:
-                print(f"Silero пропустил фрагмент ({chunk_err!r}): {sent!r}")
-                continue
-            audio_np = audio.numpy() * 32767
-            out.write(audio_np.astype(np.int16).tobytes())
-            spoke_any = True
-        out.stop_stream()
-        out.close()
+        try:
+            while True:
+                chunk = audio_q.get()
+                if chunk is None:
+                    break
+                out.write(chunk)
+                spoke_any = True
+        finally:
+            out.stop_stream()
+            out.close()
         if not spoke_any:
             raise RuntimeError("не удалось синтезировать ни одного фрагмента")
     except Exception as e:
@@ -289,67 +313,82 @@ def listen_for_command(audio_stream, play_sound=True, activation_timeout=None):
         print(f"Ошибка: Неизвестный движок распознавания '{ASR_ENGINE}'")
         return "ошибка"
 
+def _run_quick_command(text):
+    """Быстрые голосовые команды без LLM. True — команда распознана и выполнена."""
+    if SOUND_MINUS_WORD in text:
+        print(f"Быстрая команда: '{SOUND_MINUS_WORD}'. Уменьшаю громкость.")
+        sound_minus()
+    elif SOUND_PLUS_WORD in text:
+        print(f"Быстрая команда: '{SOUND_PLUS_WORD}'. Увеличиваю громкость.")
+        sound_plus()
+    elif PAUSE_WORD in text:
+        print(f"Быстрая команда: '{PAUSE_WORD}'. Ставлю на паузу.")
+        play_pause()
+    elif PLAY_WORD in text:
+        print(f"Быстрая команда: '{PLAY_WORD}'. Продолжаю воспроизведение.")
+        play_pause()
+    elif NEXT_WORD in text:
+        print(f"Быстрая команда: '{NEXT_WORD}'. Следующий медия.")
+        next_media()
+    elif BACK_WORD in text:
+        print(f"Быстрая команда: '{BACK_WORD}'. Предыдущая медия.")
+        back_media()
+    elif UP_WORD in text:
+        print(f"Быстрая команда: '{UP_WORD}'. Вверх.")
+        up()
+    elif DOWN_WORD in text:
+        print(f"Быстрая команда: '{DOWN_WORD}'. Вниз")
+        down()
+    else:
+        return False
+    return True
+
 def wait_for_wake_word(audio_stream):
     recognizer = vosk.KaldiRecognizer(vosk_model, INPUT_SAMPLE_RATE)
     recognizer.SetWords(True)
-    
+
     print(f"\nОжидание команд ({WAKE_WORD}, {SOUND_PLUS_WORD}, {SOUND_MINUS_WORD}, {PAUSE_WORD}, {PLAY_WORD})...")
+
+    # Финальный результат Vosk приходит только после паузы в речи, поэтому одно
+    # кодовое слово и быстрые команды ловим уже по partial — это на сотни мс быстрее.
+    wake_hold_since = None
+    last_quick = 0.0
 
     while not stop_event.is_set():
         try:
-            data = audio_stream.read(4096, exception_on_overflow=False)
+            data = audio_stream.read(WAKE_BLOCK_SIZE, exception_on_overflow=False)
             if recognizer.AcceptWaveform(data):
-                result_json = recognizer.Result()
-                result_dict = json.loads(result_json)
-                text = result_dict.get("text", "")
+                text = json.loads(recognizer.Result()).get("text", "")
+                wake_hold_since = None
 
-                if SOUND_MINUS_WORD in text:
-                    print(f"Быстрая команда: '{SOUND_MINUS_WORD}'. Уменьшаю громкость.")
-                    sound_minus()
+                if _run_quick_command(text):
+                    last_quick = time.time()
                     continue
-
-                if SOUND_PLUS_WORD in text:
-                    print(f"Быстрая команда: '{SOUND_PLUS_WORD}'. Увеличиваю громкость.")
-                    sound_plus()
-                    continue
-
-                if PAUSE_WORD in text:
-                    print(f"Быстрая команда: '{PAUSE_WORD}'. Ставлю на паузу.")
-                    play_pause()
-                    continue
-
-                if PLAY_WORD in text:
-                    print(f"Быстрая команда: '{PLAY_WORD}'. Продолжаю воспроизведение.")
-                    play_pause()
-                    continue
-
-                if NEXT_WORD in text:
-                    print(f"Быстрая команда: '{NEXT_WORD}'. Следующий медия.")
-                    next_media()
-                    continue
-                        
-                if BACK_WORD in text:
-                    print(f"Быстрая команда: '{BACK_WORD}'. Предыдущая медия.")
-                    back_media()
-                    continue
-
-                if UP_WORD in text:
-                    print(f"Быстрая команда: '{UP_WORD}'. Вверх.")
-                    up()
-
-                if DOWN_WORD in text:
-                    print(f"Быстрая команда: '{UP_WORD}'. Вниз")
-                    down()
 
                 if WAKE_WORD in text:
                     print(f"▶️ Кодовое слово '{WAKE_WORD}' обнаружено!")
                     command_part = text.split(WAKE_WORD, 1)[-1].strip()
                     return command_part
+            else:
+                partial = json.loads(recognizer.PartialResult()).get("partial", "")
+                if WAKE_WORD in partial:
+                    if partial.split(WAKE_WORD, 1)[-1].strip():
+                        wake_hold_since = None  # фраза продолжается — ждём финальный результат
+                    elif wake_hold_since is None:
+                        wake_hold_since = time.time()
+                    elif time.time() - wake_hold_since >= WAKE_PARTIAL_HOLD_S:
+                        print(f"▶️ Кодовое слово '{WAKE_WORD}' обнаружено (partial)!")
+                        return ""
+                else:
+                    wake_hold_since = None
+                    if partial and time.time() - last_quick > QUICK_COMMAND_COOLDOWN_S and _run_quick_command(partial):
+                        last_quick = time.time()
+                        recognizer.Reset()
 
         except IOError as e:
             print(f"Ошибка чтения потока в wait_for_wake_word: {e}")
             break
-            
+
     return None
 
 async def voice_assistant_logic():
@@ -436,19 +475,6 @@ def shutdown_app():
     stop_event.set()
 
 
-def _warm_up_omniparser():
-    """Load the OmniParser vision models once at startup, off the hot path,
-    so the first `scrape_application` during a conversation is not stalled ~7s."""
-    try:
-        import time as _t
-        from agent.vision.omniparser_engine import OmniParserEngine
-        t0 = _t.time()
-        OmniParserEngine()
-        print(f"OmniParser прогрет за {_t.time() - t0:.1f} с.")
-    except Exception as e:
-        print(f"Не удалось прогреть OmniParser: {e}")
-
-
 def _warm_up_app_cache():
     """Список установленных приложений (3 запроса PowerShell) — заранее, а не
     на первом find_application_name посреди разговора."""
@@ -459,7 +485,6 @@ def _warm_up_app_cache():
         print(f"Не удалось прогреть кэш приложений: {e}")
 
 
-threading.Thread(target=_warm_up_omniparser, daemon=True).start()
 threading.Thread(target=_warm_up_app_cache, daemon=True).start()
 
 assistant_thread = threading.Thread(target=lambda: asyncio.run(voice_assistant_logic()), daemon=True)

@@ -1,10 +1,9 @@
 """Screenshot-driven window agent (single VLM model).
 
-The orchestrator delegates here via `interact_with_window_visual` for windows the
-structured OmniParser agent can't handle — browsers, Electron/Chromium apps
-(Spotify, Discord, VS Code), games, canvas UIs.
-
-The agent loops: capture_window -> look at the image -> one action -> repeat.
+The orchestrator delegates every GUI task here via `interact_with_window`. The agent
+sees a screenshot of the window (the first one is attached to the request), acts with
+the keyboard and pixel clicks, and re-captures to read the result:
+look at the image -> act -> capture_window -> repeat.
 """
 
 import asyncio
@@ -17,11 +16,11 @@ from langchain_core.tools import tool
 from langgraph.graph import StateGraph, END
 from typing import TypedDict
 
-from agent.models.openrouter_models import vlm_vision
+from agent.models.openrouter_models import haiku_55 as window_model
 from agent.tools.vision_control_tools import capture_window, click_window, scroll_window
 from agent.tools.pc_control_tools import simulate_keyboard
 from agent.tools.useful_tools import waiting
-from agent.prompts.visual_window_prompt import visual_window_agent_prompt as prompt
+from agent.prompts.window_agent_prompt import window_agent_prompt as prompt
 
 # Logging is configured once by utils.logging_setup.setup_logging() at process
 # start (see main.py / server.py). Fall back to a basic console config only when
@@ -36,7 +35,7 @@ MAX_STEPS = 12  # ходов с вызовом инструментов на о�
 
 tools = [capture_window, click_window, scroll_window, simulate_keyboard, waiting]
 tools_by_name = {t.name: t for t in tools}
-model_with_tools = vlm_vision.bind_tools(tools)
+model_with_tools = window_model.bind_tools(tools)
 
 
 class AgentState(TypedDict):
@@ -57,7 +56,7 @@ def _is_image_msg(m) -> bool:
 
 
 async def agent_node(state: AgentState) -> dict:
-    logging.info("--- [Visual Agent] Вход в agent_node ---")
+    logging.info("--- [Window Agent] Вход в agent_node ---")
 
     # Жёсткий лимит в коде: промптовое «~12 действий» модель игнорирует
     # (было 30 вызовов LLM и 94 с на одной паузе в Spotify).
@@ -66,7 +65,7 @@ async def agent_node(state: AgentState) -> dict:
         last_result = next(
             (m.content for m in reversed(state["messages"]) if isinstance(m, ToolMessage)), "—"
         )
-        logging.warning(f"⚠️ [Visual Agent] Лимит шагов ({MAX_STEPS}) исчерпан — останавливаю.")
+        logging.warning(f"⚠️ [Window Agent] Лимит шагов ({MAX_STEPS}) исчерпан — останавливаю.")
         return {"messages": state["messages"] + [AIMessage(content=(
             f"FAILURE: лимит в {MAX_STEPS} действий исчерпан, задача не подтверждена. "
             f"Результат последнего действия: {_short(last_result, 300)}"
@@ -76,7 +75,7 @@ async def agent_node(state: AgentState) -> dict:
         if getattr(msg, "type", "") == "ai" and not getattr(msg, "content", "") and getattr(msg, "tool_calls", None):
             msg.content = "Вызываю инструменты..."
 
-    logging.info(f"[Visual Agent] Сообщений в истории: {len(state['messages'])}")
+    logging.info(f"[Window Agent] Сообщений в истории: {len(state['messages'])}")
     t0 = time.time()
 
     response = None
@@ -86,7 +85,7 @@ async def agent_node(state: AgentState) -> dict:
             break
         except Exception as e:
             if "429" in str(e) or "rate" in str(e).lower():
-                logging.warning(f"⚠️ [Visual Agent 429] Лимит запросов. Ожидание 3 сек ({attempt+1}/3)...")
+                logging.warning(f"⚠️ [Window Agent 429] Лимит запросов. Ожидание 3 сек ({attempt+1}/3)...")
                 await asyncio.sleep(3)
             else:
                 raise
@@ -94,22 +93,22 @@ async def agent_node(state: AgentState) -> dict:
         raise RuntimeError("Ошибка OpenRouter: превышен лимит запросов (429).")
 
     logging.info(
-        f"⏱️ [Visual Agent LLM TIME] Ответ за {time.time() - t0:.2f}с. tool_calls: "
+        f"⏱️ [Window Agent LLM TIME] Ответ за {time.time() - t0:.2f}с. tool_calls: "
         f"{bool(getattr(response, 'tool_calls', None))}"
     )
     reasoning = (getattr(response, "additional_kwargs", {}) or {}).get("reasoning_content")
     if reasoning:
-        logging.info(f"[Visual Agent] Рассуждение: {_short(reasoning)}")
+        logging.info(f"[Window Agent] Рассуждение: {_short(reasoning)}")
     if getattr(response, "content", ""):
-        logging.info(f"[Visual Agent] Ответ: {_short(response.content)}")
+        logging.info(f"[Window Agent] Ответ: {_short(response.content)}")
     for tc in getattr(response, "tool_calls", None) or []:
-        logging.info(f"[Visual Agent] → план: {tc['name']}({tc.get('args', {})})")
+        logging.info(f"[Window Agent] → план: {tc['name']}({tc.get('args', {})})")
 
     return {"messages": state["messages"] + [response]}
 
 
 async def tool_node(state: AgentState) -> dict:
-    logging.info("--- [Visual Agent] Вход в tool_node ---")
+    logging.info("--- [Window Agent] Вход в tool_node ---")
     last = state["messages"][-1]
     new_capture = any(tc["name"] == "capture_window" for tc in last.tool_calls)
 
@@ -125,14 +124,14 @@ async def tool_node(state: AgentState) -> dict:
     for tc in last.tool_calls:
         tool = tools_by_name.get(tc["name"])
         t0 = time.time()
-        logging.info(f"[Visual Agent] Выполнение: {tc['name']}({tc.get('args', {})})")
+        logging.info(f"[Window Agent] Выполнение: {tc['name']}({tc.get('args', {})})")
         if tool is None:
             tool_results.append(ToolMessage(content=f"Ошибка: неизвестный инструмент '{tc['name']}'.", tool_call_id=tc["id"]))
             continue
         try:
             obs = await tool.ainvoke(tc["args"])
         except Exception as e:
-            logging.error(f"[Visual Agent] Ошибка инструмента {tc['name']}: {e}")
+            logging.error(f"[Window Agent] Ошибка инструмента {tc['name']}: {e}")
             tool_results.append(ToolMessage(content=f"Ошибка вызова инструмента: {e}", tool_call_id=tc["id"]))
             continue
         dt = time.time() - t0
@@ -147,11 +146,11 @@ async def tool_node(state: AgentState) -> dict:
                 {"type": "text", "text": f"Скриншот окна ({w}x{h} px):"},
                 {"type": "image_url", "image_url": {"url": f"data:{obs['mime_type']};base64,{obs['screenshot_data']}"}},
             ]))
-            logging.info(f"[Visual Agent] capture_window за {dt:.2f}с → {w}x{h}")
+            logging.info(f"[Window Agent] capture_window за {dt:.2f}с → {w}x{h}")
         else:
             if isinstance(obs, dict) and "error" in obs:
                 obs = f"Ошибка: {obs['error']}"
-            logging.info(f"[Visual Agent] {tc['name']} за {dt:.2f}с → {_short(obs)}")
+            logging.info(f"[Window Agent] {tc['name']} за {dt:.2f}с → {_short(obs)}")
             tool_results.append(ToolMessage(content=str(obs), tool_call_id=tc["id"]))
 
     return {"messages": history + tool_results + image_msgs}
@@ -160,9 +159,9 @@ async def tool_node(state: AgentState) -> dict:
 def should_continue(state: AgentState) -> str:
     last = state["messages"][-1]
     if getattr(last, "tool_calls", None):
-        logging.info("[Visual Agent] Цикл продолжается.")
+        logging.info("[Window Agent] Цикл продолжается.")
         return "continue"
-    logging.info("[Visual Agent] Цикл завершён.")
+    logging.info("[Window Agent] Цикл завершён.")
     return "end"
 
 
@@ -177,39 +176,58 @@ graph = workflow.compile()
 config = {"recursion_limit": 60}
 
 
-async def request_to_visual_agent(req: str) -> str:
-    logging.info(f"[Visual Agent] Запрос к агенту: {req}")
+async def request_to_window_agent(req: str, first_shot: dict) -> str:
+    """Runs the agent loop. `first_shot` is the capture_window result for the window,
+    attached to the request so the model starts from what is on screen (saves a round)."""
+    logging.info(f"[Window Agent] Запрос к агенту: {req}")
     try:
-        input_data = {"messages": [SystemMessage(prompt), HumanMessage(content=req)]}
+        # Отдельным сообщением: tool_node подменяет старые скриншоты заглушкой целиком,
+        # текст задачи при этом должен остаться.
+        shot_msg = HumanMessage(content=[
+            {"type": "text", "text": f"Скриншот окна сейчас ({first_shot['width']}x{first_shot['height']} px) — это твой первый capture_window:"},
+            {"type": "image_url", "image_url": {"url": f"data:{first_shot['mime_type']};base64,{first_shot['screenshot_data']}"}},
+        ])
+        input_data = {"messages": [SystemMessage(prompt), HumanMessage(content=req), shot_msg]}
         response = await graph.ainvoke(input=input_data, config=config)
         final_answer = response["messages"][-1].content
-        logging.info(f"[Visual Agent] Финальный ответ: {final_answer}")
+        logging.info(f"[Window Agent] Финальный ответ: {final_answer}")
         return final_answer
     except Exception as e:
-        logging.error(f"[Visual Agent] Ошибка работы агента: {e}", exc_info=True)
-        return f"Ошибка работы визуального агента: {e}"
+        logging.error(f"[Window Agent] Ошибка работы агента: {e}", exc_info=True)
+        return f"Ошибка работы агента окна: {e}"
 
 
 @tool
-async def interact_with_window_visual(win_name: str = "", task: str = "") -> str:
+async def interact_with_window(win_name: str = "", task: str = "") -> str:
     """
-Delegates a task to the VISUAL window agent, which drives a window purely from
-screenshots (no accessibility/element tree). Use this INSTEAD of `interact_with_window`
-for non-standard UIs: web browsers, Electron/Chromium apps (Spotify, Discord, Slack,
-VS Code), games, media players, and anything where `interact_with_window` failed to
-find the elements it needed.
+Delegates a task to the Window Agent, which operates a window by looking at screenshots
+of it (keyboard + clicks). Works for any GUI app: Calculator, Notepad, Settings, browsers,
+Electron apps (Spotify, Discord, VS Code), games.
 Arguments:
 - win_name: The exact window title from your window tools (e.g. "Spotify Premium").
 - task: What to achieve, described as a GOAL (e.g. "Play the playlist named 'Python'").
-Returns the result of the interaction or an error message.
+Returns "SUCCESS: ...", "PARTIAL: ..." (actions were already done — do NOT call again),
+"FAILURE: ..." or an error message.
 """
     if not win_name or not task:
         return "Ошибка: обязательны оба аргумента: win_name (название окна) и task (описание задачи)."
 
-    logging.info(f"[Tool: interact_with_window_visual] Окно '{win_name}', задача: '{task}'")
+    logging.info(f"[Tool: interact_with_window] Окно '{win_name}', задача: '{task}'")
     try:
+        # Первый скриншот делаем сами, до первого вызова LLM: экономит целый раунд,
+        # а если окна нет — отвечаем сразу, без LLM.
+        try:
+            first_shot = await capture_window.ainvoke({"name": win_name})
+        except Exception as e:
+            logging.info(f"[Tool: interact_with_window] Начальный скриншот не удался: {e}")
+            return f"FAILURE: не удалось сделать скриншот окна '{win_name}': {e}"
+
         req = json.dumps({"window_name": win_name, "task": task}, ensure_ascii=False)
-        return await request_to_visual_agent(req)
+        result = await request_to_window_agent(req, first_shot)
+        if result.lstrip().upper().startswith("PARTIAL"):
+            result += (" [NOTE: the actions were already performed — do NOT call "
+                       "interact_with_window again for this task; report the outcome.]")
+        return result
     except Exception as e:
-        logging.error(f"[Tool: interact_with_window_visual] Ошибка: {e}", exc_info=True)
-        return f"Ошибка при запросе к визуальному агенту: {e}"
+        logging.error(f"[Tool: interact_with_window] Ошибка: {e}", exc_info=True)
+        return f"Ошибка при запросе к агенту окна: {e}"

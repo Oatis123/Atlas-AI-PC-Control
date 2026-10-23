@@ -21,16 +21,12 @@ _CLASSIC_APP_PATHS_CACHE_TIME = 0
 from pywinauto import Desktop
 from pywinauto.application import Application
 from pywinauto.findwindows import ElementNotFoundError
-from PIL import ImageGrab
 
 import pyautogui
 import pyperclip
 
 # По умолчанию pyautogui спит 0.1с после КАЖДОГО вызова (press/click/moveTo...).
 pyautogui.PAUSE = 0.02
-
-ELEMENTS_CACHE = {}
-CURRENT_ID = 0
 
 def _type_unicode_text(text: str):
     """Reliable method for entering Unicode text (including non-ASCII) via the system clipboard."""
@@ -50,6 +46,52 @@ def _type_unicode_text(text: str):
         time.sleep(0.1) # Wait for Windows to update clipboard
         pyautogui.hotkey('shift', 'insert') # Pastes layout-independently
         time.sleep(0.05)
+
+_INPUT_KEYBOARD = 1
+_KEYEVENTF_KEYUP = 0x0002
+_KEYEVENTF_UNICODE = 0x0004
+_ULONG_PTR = ctypes.c_size_t
+
+
+class _KEYBDINPUT(ctypes.Structure):
+    _fields_ = [("wVk", ctypes.c_ushort), ("wScan", ctypes.c_ushort),
+                ("dwFlags", ctypes.c_ulong), ("time", ctypes.c_ulong),
+                ("dwExtraInfo", _ULONG_PTR)]
+
+
+class _MOUSEINPUT(ctypes.Structure):
+    _fields_ = [("dx", ctypes.c_long), ("dy", ctypes.c_long),
+                ("mouseData", ctypes.c_ulong), ("dwFlags", ctypes.c_ulong),
+                ("time", ctypes.c_ulong), ("dwExtraInfo", _ULONG_PTR)]
+
+
+class _INPUT(ctypes.Structure):
+    class _U(ctypes.Union):
+        # MOUSEINPUT нужен только ради правильного размера union (иначе SendInput отвергает структуру).
+        _fields_ = [("ki", _KEYBDINPUT), ("mi", _MOUSEINPUT)]
+    _anonymous_ = ("u",)
+    _fields_ = [("type", ctypes.c_ulong), ("u", _U)]
+
+
+def _send_unicode_char(code_unit: int):
+    inputs = (_INPUT * 2)()
+    for i, flags in enumerate((_KEYEVENTF_UNICODE, _KEYEVENTF_UNICODE | _KEYEVENTF_KEYUP)):
+        inputs[i].type = _INPUT_KEYBOARD
+        inputs[i].ki = _KEYBDINPUT(0, code_unit, flags, 0, 0)
+    ctypes.windll.user32.SendInput(2, ctypes.byref(inputs), ctypes.sizeof(_INPUT))
+
+
+def _type_text_layout_independent(text: str, interval: float = 0.05):
+    """Печатает текст реальными нажатиями через SendInput (Unicode-пакеты).
+    В отличие от pyautogui.write не зависит от раскладки: при русской раскладке
+    pyautogui молча пропускает латинские буквы (VkKeyScan не находит их), и в поле
+    остаются только символы, общие для обеих раскладок, например '-'."""
+    for ch in text:
+        raw = ch.encode('utf-16-le')
+        for i in range(0, len(raw), 2):  # символы вне BMP уходят суррогатной парой
+            _send_unicode_char(int.from_bytes(raw[i:i + 2], 'little'))
+        time.sleep(interval)
+
 
 def _decamel(text: str) -> str:
     """`Microsoft.WindowsCalculator` -> `Windows Calculator` (last dotted segment, split on caps)."""
@@ -453,221 +495,6 @@ def _focus_window(win, settle: float = 0.3) -> bool:
     time.sleep(settle)
     return True
 
-def _register_elements(elements, rect) -> str:
-    """Кладёт распознанные элементы в ELEMENTS_CACHE (абсолютные экранные координаты,
-    по ним кликает interact_with_element_by_id) и возвращает XML <WindowVision>.
-
-    elements: [{"left","top","right","bottom" (px относительно окна), "name", "control_type"}]
-    rect: прямоугольник окна на экране (pywinauto .rectangle()).
-    Общий для scrape_application (OmniParser) и scrape_application_vision (VLM)."""
-    global CURRENT_ID
-    ELEMENTS_CACHE.clear()
-    CURRENT_ID = 0
-
-    xml_lines = ["<WindowVision>"]
-    for elem in elements:
-        elem_id = CURRENT_ID
-        # Map window-relative coordinates to absolute screen coordinates
-        ELEMENTS_CACHE[elem_id] = {
-            "left": rect.left + elem["left"], "top": rect.top + elem["top"],
-            "right": rect.left + elem["right"], "bottom": rect.top + elem["bottom"],
-            "name": elem["name"],
-            "control_type": elem["control_type"]
-        }
-        CURRENT_ID += 1
-
-        safe_name = elem["name"].replace('"', '&quot;').replace('<', '&lt;').replace('>', '&gt;')
-        tag = elem["control_type"].replace("/", "_")
-        # Include spatial coordinates hint so LLM understands layout (row/column position)
-        rel_cx = (elem["left"] + elem["right"]) // 2
-        rel_cy = (elem["top"] + elem["bottom"]) // 2
-        xml_lines.append(f'  <{tag} id="{elem_id}" name="{safe_name}" pos="x:{rel_cx},y:{rel_cy}" />')
-
-    xml_lines.append("</WindowVision>")
-    return "\n".join(xml_lines)
-
-
-@tool
-def scrape_application(name: str) -> str:
-    """
-    Сканирует окно приложения с помощью визуального нейросетевого парсера OmniParser.
-    Делает скриншот окна приложения, детектует активные элементы (кнопки, иконки, поля ввода, текст)
-    и присваивает каждому элементу уникальный 'id' для взаимодействия.
-
-    Args:
-        name (str): Часть заголовка окна для поиска.
-    """
-    start_time = time.time()
-    global ELEMENTS_CACHE, CURRENT_ID
-    ELEMENTS_CACHE.clear()
-    CURRENT_ID = 0
-
-    logging.info(f"🔍 [OmniParser] Поиск окна для скрапинга: '{name}'...")
-
-    try:
-        app_name = name.split(" - ")[-1].strip() if " - " in name else name.strip()
-
-        try:
-            main_win = _get_window_by_name(name)
-        except ElementNotFoundError:
-            elapsed = time.time() - start_time
-            logging.info(f"❌ [OmniParser] Окно '{name}' не найдено ({elapsed:.4f} сек).")
-            return f"Ошибка: Окно с именем, содержащим '{name}', не найдено."
-
-        if _focus_window(main_win):
-            logging.info(f"↗️ [OmniParser] Фокусировка на окне '{app_name}'...")
-
-        rect = main_win.rectangle()
-        if rect.width() <= 0 or rect.height() <= 0:
-            logging.warning(f"⚠️ [OmniParser] Окно '{app_name}' имеет нулевой размер {rect}.")
-            return "Ошибка: Окно имеет нулевой размер или свернуто."
-
-        # Capture window screenshot
-        bbox = (rect.left, rect.top, rect.right, rect.bottom)
-        logging.info(f"📸 [OmniParser] Захват скриншота области окна: X={rect.left}, Y={rect.top}, W={rect.width()}, H={rect.height()}...")
-        img = ImageGrab.grab(bbox=bbox, all_screens=True)  # иначе окна на других мониторах выходят чёрными
-
-        # Parse screenshot with OmniParser engine
-        logging.info(f"🧠 [OmniParser] Запуск распознавания элементов (YOLO + OCR)...")
-        from agent.vision.omniparser_engine import OmniParserEngine
-        engine = OmniParserEngine()
-        elements = engine.parse_image(img)
-
-        if not elements:
-            logging.warning(f"⚠️ [OmniParser] Элементы не найдены на скриншоте '{app_name}'.")
-            return "OmniParser не обнаружил интерактивных элементов на скриншоте окна."
-
-        xml_output = _register_elements(elements, rect)
-
-        elapsed = time.time() - start_time
-        logging.info(f"⏱️ [OmniParser] Окно '{name}' успешно распознано за {elapsed:.4f} сек. Найдено {CURRENT_ID} элементов!")
-        return xml_output
-
-    except ElementNotFoundError:
-        elapsed = time.time() - start_time
-        logging.info(f"❌ [OmniParser] Окно '{name}' не найдено ({elapsed:.4f} сек).")
-        return f"Произошла ошибка: Окно с именем '{name}' не найдено после ожидания."
-    except Exception as e:
-        logging.error(f"💥 [OmniParser] Ошибка при сканировании окна '{name}': {e}", exc_info=True)
-        return f"Произошла ошибка скрапинга OmniParser: {e}"
-    
-
-@tool
-def interact_with_element_by_id(
-    name: str,
-    element_id: int = -1,
-    action: str = None,
-    text_to_set: Optional[str] = None
-) -> Union[str, Any]:
-    """
-    Находит UI-элемент по его точным координатам в указанном окне и выполняет над ним определённое действие.
-
-    Args:
-        name (str): Часть заголовка окна приложения для поиска. Например, 'Mozilla Firefox' или 'Калькулятор'.
-        element_id (int): ID целевого элемента (число из атрибута id="..." в выводе `scrape_application`). Передавай именно параметр `element_id`.
-        action (str): Действие, которое необходимо выполнить над элементом. Поддерживаемые действия:
-                      - Клики: 'click', 'double_click', 'right_click'.
-                      - Работа с текстом: 'set_text', 'get_text', 'press_enter'.
-                      - Прокрутка: 'scroll_up', 'scroll_down', 'scroll_left', 'scroll_right'.
-                      - Масштабирование (применяется ко всему окну): 'zoom_in', 'zoom_out'.
-        text_to_set (Optional[str]): Текстовая строка для ввода. Является обязательным аргументом только для действия 'set_text'.
-
-    Returns:
-        Union[str, Any]:
-            - В случае успеха для большинства действий — строка с сообщением об успехе (например, "Действие 'click' успешно выполнено.").
-            - Для действия 'get_text' — текст, содержащийся в элементе.
-            - В случае ошибки — строка с описанием ошибки (например, "Ошибка: Элемент с координатами ... не найден.").
-    """
-    try:
-        main_win = _get_window_by_name(name)
-        if element_id not in ELEMENTS_CACHE and 'zoom' not in action and action not in ["type_text_blind", "press_enter"]:
-            return f"Ошибка: Элемент с id {element_id} не найден в кэше."
-
-        if element_id in ELEMENTS_CACHE:
-            el_data = ELEMENTS_CACHE[element_id]
-            center_x = (el_data['left'] + el_data['right']) // 2
-            center_y = (el_data['top'] + el_data['bottom']) // 2
-        else:
-            center_x, center_y = 0, 0
-
-        action = action.lower()
-        if action == 'click':
-            pyautogui.click(center_x, center_y)
-        elif action == 'double_click':
-            pyautogui.doubleClick(center_x, center_y)
-        elif action == 'right_click':
-            pyautogui.rightClick(center_x, center_y)
-        
-        elif action == 'set_text':
-            if text_to_set is None:
-                return "Ошибка: для действия 'set_text' необходимо передать аргумент 'text_to_set'."
-            
-            # 1. Кликаем по элементу — это выведет окно на передний план
-            pyautogui.click(center_x, center_y)
-            time.sleep(0.15)
-
-            # 2. Стираем старое содержимое
-            pyautogui.hotkey('ctrl', 'a')
-            pyautogui.press('delete')
-            time.sleep(0.1)
-
-            # 3. Вводим текст через буфер обмена для поддержки любых языков
-            _type_unicode_text(text_to_set)
-            
-            return f"Действие '{action}' успешно выполнено."
-            
-        elif action == "type_text_blind":
-            if not text_to_set:
-                return "Ошибка: нужен text_to_set."
-
-            main_win.set_focus()
-            _type_unicode_text(text_to_set)
-            
-        elif action == 'press_enter':
-            # Вместо клика по элементу, жестко активируем само окно
-            main_win.set_focus()
-            time.sleep(0.1)
-            
-            # Вариант А: Отправляем Enter через встроенный синтаксис pywinauto
-            main_win.type_keys('~')
-            
-        elif action == 'get_text':
-            text = ELEMENTS_CACHE.get(element_id, {}).get("name", "") or ""
-            # "Icon_N" — это ярлык-заглушка детектора иконок, а не распознанный текст.
-            if not text.strip() or re.fullmatch(r"Icon_\d+", text.strip()):
-                return (f"У элемента id={element_id} нет распознанного текста. "
-                        f"Читай значения прямо из результата scrape_application.")
-            return text
-
-        elif action == 'scroll_up':
-            pyautogui.moveTo(center_x, center_y)
-            pyautogui.scroll(500)
-        elif action == 'scroll_down':
-            pyautogui.moveTo(center_x, center_y)
-            pyautogui.scroll(-500)
-        elif action == 'scroll_left':
-            pyautogui.moveTo(center_x, center_y)
-            pyautogui.hscroll(-500)
-        elif action == 'scroll_right':
-            pyautogui.moveTo(center_x, center_y)
-            pyautogui.hscroll(500)
-
-        elif action == 'zoom_in':
-            main_win.type_keys('^{PLUS}')
-        elif action == 'zoom_out':
-            main_win.type_keys('^{MINUS}')
-            
-        else:
-            return f"Ошибка: Неизвестное действие '{action}'."
-        
-        return f"Действие '{action}' успешно выполнено."
-
-    except ElementNotFoundError:
-        return f"Ошибка: Окно с именем '{name}' не найдено."
-    except Exception as e:
-        return f"Произошла непредвиденная ошибка: {type(e).__name__}: {e}"
-    
-
 @tool
 def simulate_keyboard(name: str, keys: str) -> str:
     """
@@ -717,7 +544,7 @@ def simulate_keyboard(name: str, keys: str) -> str:
         elif keys.isascii() and '\n' not in keys and len(keys) <= 30:
             pyautogui.press('shift')   # «разбудить» ввод в окне, чтобы не потерять первый символ
             time.sleep(0.1)
-            pyautogui.write(keys, interval=0.05)
+            _type_text_layout_independent(keys, interval=0.05)
             return f"Выполнен ввод символов: {keys}"
 
         # Иначе (длинный или не-ASCII текст) — быстрый и надёжный путь через буфер.

@@ -23,10 +23,6 @@ VOSK_MODEL_URL = f"https://alphacephei.com/vosk/models/{VOSK_MODEL_NAME}.zip"
 SILERO_MODEL_FILE = os.path.join(PROJECT_ROOT, "model_silero.pt")
 SILERO_MODEL_URL = "https://models.silero.ai/models/tts/ru/v4_ru.pt"
 
-# --- OmniParser (vision UI parsing) ---
-OMNIPARSER_WEIGHTS_DIR = os.path.join(PROJECT_ROOT, "agent", "vision", "weights")
-OMNIPARSER_REPOS = ["microsoft/OmniParser-v2.0", "microsoft/OmniParser"]
-
 
 def _download_with_progress(url, dest):
     name = url.rsplit("/", 1)[-1]
@@ -89,39 +85,10 @@ def ensure_silero_model():
     return SILERO_MODEL_FILE
 
 
-def ensure_omniparser_weights(weights_dir=OMNIPARSER_WEIGHTS_DIR):
-    """Return the OmniParser weights directory, downloading the weights if absent."""
-    icon_detect = os.path.join(weights_dir, "icon_detect", "model.pt")
-    icon_caption = os.path.join(weights_dir, "icon_caption", "model.safetensors")
-    if os.path.exists(icon_detect) and os.path.exists(icon_caption):
-        return weights_dir
-
-    from huggingface_hub import snapshot_download
-
-    os.makedirs(weights_dir, exist_ok=True)
-    last_err = None
-    for repo_id in OMNIPARSER_REPOS:
-        try:
-            logger.info("Скачиваю веса OmniParser из %s...", repo_id)
-            snapshot_download(
-                repo_id=repo_id,
-                local_dir=weights_dir,
-                ignore_patterns=["*.git*", "README.md"],
-            )
-            logger.info("Веса OmniParser готовы: %s", weights_dir)
-            return weights_dir
-        except Exception as e:
-            logger.warning("Не удалось скачать %s: %s", repo_id, e)
-            last_err = e
-
-    raise RuntimeError(f"Не удалось скачать веса OmniParser: {last_err}")
-
-
 def ensure_all():
     """Provision every model the project needs. Handy for a one-shot setup run."""
     ensure_vosk_model()
     ensure_silero_model()
-    ensure_omniparser_weights()
 
 
 if __name__ == "__main__":

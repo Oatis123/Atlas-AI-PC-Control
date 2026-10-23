@@ -1,9 +1,8 @@
 """Tools for the screenshot-driven (VLM) window agent.
 
-The visual agent SEES a screenshot of the target window and acts on it by pixel
-coordinates read straight from that image — no OmniParser, no element IDs. Good
-for Chromium/Electron apps (Spotify, Discord), games, canvas UIs, and any window
-where the structured agent can't map elements.
+The window agent SEES a screenshot of the target window and acts on it by pixel
+coordinates read straight from that image — no element tree, no element IDs. Works
+for any window: native apps, Chromium/Electron apps (Spotify, Discord), games, canvas UIs.
 """
 
 import base64
@@ -55,8 +54,9 @@ def _to_screen(name: str, x, y):
 @tool
 def capture_window(name: str) -> dict:
     """
-    Скриншотит указанное окно и возвращает картинку для анализа. Это ВСЕГДА твоё
-    первое действие в задаче. Возвращает изображение и его размер в пикселях —
+    Скриншотит указанное окно и возвращает картинку для анализа. Первый скриншот
+    уже приложен к задаче; вызывай это после действий, чтобы увидеть результат.
+    Возвращает изображение и его размер в пикселях —
     координаты для click_window / scroll_window бери прямо с этой картинки.
 
     Args:
@@ -76,7 +76,7 @@ def capture_window(name: str) -> dict:
     img.save(buf, format="JPEG", quality=85, optimize=True)
     b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
     logging.info(
-        f"[Visual Agent] capture_window '{name}': {img.size[0]}x{img.size[1]} px (scale {scale:.2f})"
+        f"[Window Agent] capture_window '{name}': {img.size[0]}x{img.size[1]} px (scale {scale:.2f})"
     )
     return {
         "screenshot_data": b64,

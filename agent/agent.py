@@ -11,9 +11,9 @@ from agent.tools.pc_control_tools import *
 from agent.tools.web_tools import search_web
 from agent.tools.useful_tools import waiting
 from agent.tools.screen_tools import get_screenshot_tool
-from agent.window_interaction_agent import interact_with_window
-from agent.visual_window_agent import interact_with_window_visual
+from agent.window_agent import interact_with_window
 import langchain
+import asyncio
 import json
 
 tools = [
@@ -24,11 +24,10 @@ tools = [
          waiting,
         #  get_screenshot_tool,
          search_web,
-         interact_with_window,
-         interact_with_window_visual]
+         interact_with_window]
 
 tools_by_name = {tool.name: tool for tool in tools}
-model_with_tools = laguna_s_21.bind_tools(tools)
+model_with_tools = deepseek_v41_flash.bind_tools(tools)
 
 
 # Logging is configured once by utils.logging_setup.setup_logging() at process
@@ -154,7 +153,7 @@ async def agent_node(state):
 
 async def tool_node(state: AgentState) -> dict:
     logging.info("--- Вход в tool_node ---")
-    tools_to_hide = ["scrape_application", "get_installed_software", "get_screenshot_tool"]
+    tools_to_hide = ["get_installed_software", "get_screenshot_tool"]
     last_message = state["messages"][-1]
     
     is_search_web_called_now = any(tc["name"] == "search_web" for tc in last_message.tool_calls)

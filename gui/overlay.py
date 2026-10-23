@@ -1,13 +1,13 @@
-"""Qt (PySide6) full-screen overlay for the voice assistant.
+"""Qt (PySide6) full-screen overlay for the voice assistant, in the oatis-style
+(moss / bookish): flat card, soft glowing screen edge in the phase colour, stepped card animations.
 
-Real per-pixel alpha, so the screen-edge light actually glows into transparency
-(impossible with tkinter's binary -transparentcolor key).
+Real per-pixel alpha, so the desktop stays visible under the edge and the card.
 
 Phases:
-  idle       - nothing shown, faint static edge glow
-  listening  - card with the live dictated text
-  working    - card: dictated command (dim) + "Atlas работает…"
-  answering  - card: agent's response
+  idle       - faint static edge glow (muted), no card
+  listening  - card with the live dictated text (moss edge)
+  working    - card: dictated command (muted) + "работает" (ochre edge)
+  answering  - card: agent's response (moss edge)
 
 Talks to main.py through the same thread-safe queue protocol:
   {'type': 'phase',                'name': 'idle'|'listening'|'working'|'answering', 'reset': bool}
@@ -17,59 +17,130 @@ Talks to main.py through the same thread-safe queue protocol:
 """
 
 import sys
-import math
+import html
 import queue
+from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer, QRectF
-from PySide6.QtGui import QColor, QPainter, QLinearGradient, QRadialGradient, QFont
-from PySide6.QtWidgets import QApplication, QWidget, QLabel, QVBoxLayout
+import math
 
-PHASE_RGB = {
-    "idle":      (110, 110, 110),
-    "listening": (255, 255, 255),
-    "working":   (255, 140, 0),
-    "answering": (0, 231, 103),
-}
+from PySide6.QtCore import Qt, QTimer
+from PySide6.QtGui import (QColor, QPainter, QPen, QFont, QFontDatabase,
+                           QLinearGradient, QRadialGradient)
+from PySide6.QtWidgets import QApplication, QWidget, QLabel, QVBoxLayout, QHBoxLayout
+
+FONTS_DIR = Path(__file__).resolve().parent.parent / "assets" / "fonts"
+
+# palette (dark): bg / surface / line / dim / muted / text / prose / moss / ochre
+SURFACE = QColor("#0F0F0C")
+LINE = QColor("#20211C")
+DIM = "#393A34"
+MUTED = "#75746C"
+TEXT = "#DFDDD3"
+PROSE = "#CFCDC3"
+MOSS = "#80856D"
+OCHRE = "#95876E"
+
 PHASES = ("idle", "listening", "working", "answering")
+# edge colour per phase: moss = voice / answer, ochre = the agent is alive
+EDGE_COLOR = {"idle": MUTED, "listening": MOSS, "working": OCHRE, "answering": MOSS}
 
-SPEECH_FG = "#F2F2F5"
-SPEECH_DIM_FG = "#83838A"
-STATUS_FG = "#D8D8DC"
-AGENT_FG = "#AFEEEE"
+EQ_FRAMES = ("▁▃▅▂▇▃▁▅", "▃▆▂▅▃▇▅▂", "▅▂▇▃▁▅▃▆")
+SPIN_FRAMES = ("▖", "▘", "▝", "▗")
+
+TICK_MS = 33     # edge glow pulses smoothly on this beat
+CARD_STEP = 3    # card glyphs / caret are stepped: one change per 3 ticks (~100 ms)
+CODE_FAMILY = "'JetBrains Mono', Consolas, monospace"
+
+_fonts_loaded = False
 
 
-class _Card(QWidget):
-    BG = QColor(22, 22, 23, 236)
-    STROKE = QColor(255, 255, 255, 26)
+def _load_fonts():
+    global _fonts_loaded
+    if _fonts_loaded:
+        return
+    _fonts_loaded = True
+    for ttf in FONTS_DIR.glob("*.ttf"):
+        QFontDatabase.addApplicationFont(str(ttf))
 
-    def __init__(self, parent):
+
+def _font(families, px, italic=False):
+    f = QFont()
+    f.setFamilies(families)
+    f.setPixelSize(px)
+    f.setItalic(italic)
+    return f
+
+
+def _hex_rgb(h):
+    c = QColor(h)
+    return c.red(), c.green(), c.blue()
+
+
+class _Check(QWidget):
+    """9x9 pixel-grid check mark (the style's icon grid), drawn with 1px cells."""
+    CELLS = ((0, 4), (1, 5), (2, 6), (3, 5), (4, 4), (5, 3), (6, 2), (7, 1), (8, 0))
+
+    def __init__(self, parent=None):
         super().__init__(parent)
+        self.setFixedSize(9, 9)
         self.setAttribute(Qt.WA_TranslucentBackground)
-
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(24, 16, 24, 15)
-        lay.setSpacing(8)
-
-        self.speech = QLabel("")
-        self.status = QLabel("")
-        self.agent = QLabel("")
-        for lbl, size, col in (
-            (self.speech, 14, SPEECH_FG),
-            (self.status, 12, STATUS_FG),
-            (self.agent, 15, AGENT_FG),
-        ):
-            lbl.setWordWrap(True)
-            lbl.setFont(QFont("Segoe UI", size))
-            lbl.setTextFormat(Qt.RichText)
-            lbl.setStyleSheet(f"color: {col}; background: transparent;")
-            lay.addWidget(lbl)
 
     def paintEvent(self, _):
         p = QPainter(self)
-        p.setRenderHint(QPainter.Antialiasing)
-        p.setBrush(self.BG)
-        p.setPen(self.STROKE)
-        p.drawRoundedRect(QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5), 16, 16)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(MOSS))
+        for x, y in self.CELLS:
+            p.drawRect(x, y, 1, 1)
+
+
+class _Card(QWidget):
+    def __init__(self, parent):
+        super().__init__(parent)
+        _load_fonts()
+        self.setAttribute(Qt.WA_TranslucentBackground)
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(18, 13, 18, 16)
+        lay.setSpacing(0)
+
+        head = QHBoxLayout()
+        head.setSpacing(8)
+        self.brand = QLabel("ATLAS")
+        self.brand.setFont(_font(["Silkscreen", "Martian Mono", "Consolas"], 13))
+        self.brand.setStyleSheet(f"color: {TEXT}; background: transparent;")
+        self.check = _Check()
+        self.check.hide()
+        self.state = QLabel("")
+        self.state.setTextFormat(Qt.RichText)
+        self.state.setFont(_font(["Martian Mono", "JetBrains Mono", "Consolas"], 11))
+        self.state.setStyleSheet("background: transparent;")
+        head.addWidget(self.brand)
+        head.addStretch(1)
+        head.addWidget(self.check)
+        head.addWidget(self.state)
+        lay.addLayout(head)
+        lay.addSpacing(10)
+
+        self.speech = QLabel("")
+        self.speech.setTextFormat(Qt.RichText)
+        self.speech.setWordWrap(True)
+        self.speech.setFont(_font(["Literata", "Georgia"], 17, italic=True))
+        self.speech.setStyleSheet("background: transparent;")
+        lay.addWidget(self.speech)
+
+        self.agent = QLabel("")
+        self.agent.setTextFormat(Qt.PlainText)
+        self.agent.setWordWrap(True)
+        self.agent.setFont(_font(["Literata", "Georgia"], 18))
+        self.agent.setStyleSheet(f"color: {PROSE}; background: transparent;")
+        self.agent.setContentsMargins(0, 10, 0, 0)
+        lay.addWidget(self.agent)
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.fillRect(self.rect(), SURFACE)
+        p.setPen(QPen(LINE, 1))
+        p.drawRect(self.rect().adjusted(0, 0, -1, -1))
 
 
 class _OverlayWindow(QWidget):
@@ -91,14 +162,17 @@ class _OverlayWindow(QWidget):
 
         self._phase = "idle"
         self._speech_text = ""
+        self._agent_text = ""
+        self._frame = 0
         self._t = 0.0
+        self._shown = {}  # last text pushed to each label, to skip no-op updates
 
         self.card = _Card(self)
         self.card.hide()
 
         self._anim = QTimer(self)
         self._anim.timeout.connect(self._tick)
-        self._anim.start(33)
+        self._anim.start(TICK_MS)
 
         self._poll = QTimer(self)
         self._poll.timeout.connect(self._drain)
@@ -109,22 +183,24 @@ class _OverlayWindow(QWidget):
         self._watch.start(250)
 
     # ------------------------------------------------------------------ helpers
+    def _reposition_card(self):
+        w = max(460, min(int(self.width() * 0.36), 720))
+        self.card.setFixedWidth(w)
+        lay = self.card.layout()
+        lay.activate()
+        # wrapped labels: sizeHint() ignores the width, heightForWidth does not
+        self.card.setFixedHeight(lay.totalHeightForWidth(w))
+        x = (self.width() - w) // 2
+        y = self.height() - self.card.height() - max(56, int(self.height() * 0.07))
+        self.card.move(x, max(0, y))
+
+    # ------------------------------------------------------------------- render
     def _rgb(self):
-        return PHASE_RGB.get(self._phase, PHASE_RGB["idle"])
+        return _hex_rgb(EDGE_COLOR.get(self._phase, EDGE_COLOR["idle"]))
 
     def _pulse(self):
         return 0.5 + 0.5 * math.sin(self._t)
 
-    def _reposition_card(self):
-        w = max(340, min(int(self.width() * 0.40), 680))
-        self.card.setFixedWidth(w)
-        self.card.layout().activate()
-        self.card.setFixedHeight(self.card.sizeHint().height())
-        x = (self.width() - w) // 2
-        y = self.height() - self.card.height() - 56
-        self.card.move(x, max(0, y))
-
-    # ------------------------------------------------------------------- render
     def paintEvent(self, _):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
@@ -179,15 +255,69 @@ class _OverlayWindow(QWidget):
 
     # ---------------------------------------------------------------- animation
     def _tick(self):
+        self._frame += 1
         self._t += 0.10
-        if self._phase == "working":
-            r, g, b = self._rgb()
-            dots = "." * (int(self._t * 1.4) % 4)
-            self.card.status.setText(
-                f'<span style="color:rgb({r},{g},{b})">&#9679;</span>'
-                f'&nbsp;&nbsp;Atlas работает{dots}'
-            )
-        self.update()
+        if self._phase != "idle":
+            if self._frame % CARD_STEP == 0:
+                self._refresh_card()
+            self.update()
+
+    def _set(self, label, key, text):
+        """Set label text only when it changed. True if it did."""
+        if self._shown.get(key) == text:
+            return False
+        self._shown[key] = text
+        label.setText(text)
+        return True
+
+    def _refresh_card(self):
+        """Render the card for the current phase and animation frame."""
+        c = self.card
+        f = self._frame // CARD_STEP
+        ph = self._phase
+        relayout = False
+
+        if ph == "listening":
+            eq = EQ_FRAMES[(f // 3) % 3]
+            state = (f'<span style="color:{MOSS}">слушаю</span>&nbsp;&nbsp;'
+                     f'<span style="font-family:{CODE_FAMILY}; color:{MOSS}">{eq}</span>')
+            c.check.hide()
+        elif ph == "working":
+            spin = SPIN_FRAMES[(f // 2) % 4]
+            state = (f'<span style="color:{OCHRE}">работает</span>&nbsp;&nbsp;'
+                     f'<span style="font-family:{CODE_FAMILY}; color:{OCHRE}">{spin}</span>')
+            c.check.hide()
+        else:  # answering
+            state = f'<span style="color:{MUTED}">готово</span>'
+            c.check.show()
+        self._set(c.state, "state", state)
+
+        if ph == "listening":
+            if self._speech_text:
+                caret = f'<span style="font-family:{CODE_FAMILY}; color:{MOSS}">█</span>' if (f // 5) % 2 == 0 else ""
+                say = f'<span style="color:{TEXT}">{html.escape(self._speech_text)}</span>{caret}'
+            else:
+                say = f'<span style="color:{MUTED}">…</span>'
+        else:
+            say = f'<span style="color:{MUTED}">{html.escape(self._speech_text)}</span>'
+        self._set(c.speech, "speech", say)
+        if self._shown.get("speech_plain") != self._speech_text:  # caret blinks must not re-layout
+            self._shown["speech_plain"] = self._speech_text
+            relayout = True
+
+        agent = self._agent_text if ph == "answering" else ""
+        self._set(c.agent, "agent", agent)
+        if self._shown.get("agent_plain") != agent:
+            self._shown["agent_plain"] = agent
+            relayout = True
+
+        for widget, visible in ((c.speech, ph == "listening" or bool(self._speech_text)),
+                                (c.agent, ph == "answering")):
+            if widget.isVisible() != visible and c.isVisible():
+                widget.setVisible(visible)
+                relayout = True
+        if relayout:
+            self._reposition_card()
 
     # -------------------------------------------------------------------- queue
     def _drain(self):
@@ -204,23 +334,22 @@ class _OverlayWindow(QWidget):
             name = msg.get("name", "idle")
             if msg.get("reset", name == "idle"):
                 self._speech_text = ""
+                self._agent_text = ""
             self._apply_phase(name)
 
         elif t == "user_speech":
             self._speech_text = msg.get("text", "")
             if self._phase == "idle":
                 self._apply_phase("listening")
-            elif self._phase == "listening":
-                self.card.speech.setText(self._speech_text or "Слушаю…")
-                self._reposition_card()
-            elif self._speech_text:
-                self._apply_phase(self._phase)  # refresh dim command line
+            else:
+                self._refresh_card()
 
         elif t == "agent_response_chunk":
+            self._agent_text = msg.get("text", "")
             if self._phase != "answering":
                 self._apply_phase("answering")
-            self.card.agent.setText(msg.get("text", ""))
-            self._reposition_card()
+            else:
+                self._refresh_card()
 
         elif t == "status":  # legacy compatibility
             txt = msg.get("text", "")
@@ -236,36 +365,18 @@ class _OverlayWindow(QWidget):
         if name not in PHASES:
             return
         self._phase = name
-        s, st, ag = self.card.speech, self.card.status, self.card.agent
+        c = self.card
 
         if name == "idle":
-            self.card.hide()
+            c.hide()
             self.update()
             return
 
-        if name == "listening":
-            s.setStyleSheet(f"color: {SPEECH_FG}; background: transparent;")
-            s.setText(self._speech_text or "Слушаю…")
-            s.show()
-            st.hide()
-            ag.hide()
-
-        elif name == "working":
-            s.setStyleSheet(f"color: {SPEECH_DIM_FG}; background: transparent;")
-            s.setText(self._speech_text)
-            s.setVisible(bool(self._speech_text))
-            st.setText("Atlas работает")
-            st.show()
-            ag.hide()
-
-        elif name == "answering":
-            s.setStyleSheet(f"color: {SPEECH_DIM_FG}; background: transparent;")
-            s.setText(self._speech_text)
-            s.setVisible(bool(self._speech_text))
-            st.hide()
-            ag.show()
-
-        self.card.show()
+        self._shown.clear()
+        c.show()
+        c.speech.setVisible(name == "listening" or bool(self._speech_text))
+        c.agent.setVisible(name == "answering")
+        self._refresh_card()
         self._reposition_card()
         self.update()
 
@@ -293,6 +404,7 @@ class SubtitleOverlay:
 
     def mainloop(self):
         app = QApplication.instance() or QApplication(sys.argv)
+        _load_fonts()
         self._win = _OverlayWindow(self.gui_queue, self.stop_event_callback, self.stop_event)
         self._win.show()
         self._win.raise_()

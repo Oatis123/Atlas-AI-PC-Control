@@ -19,15 +19,6 @@ async def lifespan(app: FastAPI):
     logging.info("Starting Data-Sama integration client...")
     await datasama_client.start()
     
-    # Warm up OmniParser vision engine in background thread
-    try:
-        import asyncio
-        from agent.vision.omniparser_engine import OmniParserEngine
-        logging.info("Warming up OmniParser Vision Engine...")
-        asyncio.get_event_loop().run_in_executor(None, OmniParserEngine)
-    except Exception as e:
-        logging.warning(f"Could not pre-load OmniParser engine: {e}")
-
     # Warm up the installed-apps cache (PowerShell queries) in background thread
     try:
         from agent.tools.pc_control_tools import warm_up_app_cache
@@ -107,6 +98,9 @@ async def _execute_pc_task_background(prompt_text: str):
 
         logging.info(f"--- [TASK FINISHED] Sending tool_result to Data-Sama: '{final_content}' ---")
 
+        # Clear background state so old status doesn't linger in Vivion
+        await datasama_client.send_background_update("")
+
         # 3. Send final tool_result over WS
         await datasama_client.send_tool_result(
             tool_name="execute_pc_task",
@@ -116,6 +110,11 @@ async def _execute_pc_task_background(prompt_text: str):
         logging.info("--- [WS SENT] tool_result successfully sent to Data-Sama! ---")
     except Exception as e:
         logging.error(f"Error executing agent task '{prompt_text}': {e}", exc_info=True)
+        try:
+            await datasama_client.send_background_update("")
+        except Exception as bg_err:
+            logging.warning(f"Failed to reset background update on error: {bg_err}")
+
         await datasama_client.send_tool_result(
             tool_name="execute_pc_task",
             status="error",
