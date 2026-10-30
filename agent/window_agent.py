@@ -217,7 +217,7 @@ Returns "SUCCESS: ...", "PARTIAL: ..." (actions were already done — do NOT cal
         # Первый скриншот делаем сами, до первого вызова LLM: экономит целый раунд,
         # а если окна нет — отвечаем сразу, без LLM.
         try:
-            first_shot = await capture_window.ainvoke({"name": win_name})
+            first_shot = await capture_window.ainvoke({"name": win_name, "settle": False})
         except Exception as e:
             logging.info(f"[Tool: interact_with_window] Начальный скриншот не удался: {e}")
             return f"FAILURE: не удалось сделать скриншот окна '{win_name}': {e}"

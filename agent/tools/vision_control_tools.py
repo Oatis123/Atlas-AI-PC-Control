@@ -10,7 +10,7 @@ import logging
 import time
 from io import BytesIO
 
-from PIL import Image, ImageGrab
+from PIL import Image, ImageChops, ImageGrab
 from langchain_core.tools import tool
 
 import pyautogui
@@ -18,6 +18,16 @@ import pyautogui
 from agent.tools.pc_control_tools import _get_window_by_name, _focus_window
 
 _MAX_W = 1280
+
+# Ожидание «устаканивания» экрана: два кадра с интервалом сравниваются по уменьшенным
+# копиям (сравнение ~3 мс, дорогой только сам grab ~75 мс). Пока кадры отличаются —
+# ждём дальше, но не дольше _SETTLE_TIMEOUT (видео/анимация никогда не замирают).
+_SETTLE_INTERVAL = 0.5
+_SETTLE_TIMEOUT = 4.0
+_THUMB_REDUCE = 8          # во сколько раз уменьшаем кадр для сравнения
+_PIXEL_DELTA = 16          # разница яркости (0..255), с которой пиксель считается изменённым
+_CHANGED_FRACTION = 0.003  # доля изменённых пикселей, ниже которой экран считается тем же
+                           # (мигающий курсор и шум не должны мешать)
 # hwnd -> (scale, shown_w, shown_h) of the last capture_window for that window.
 # Keyed by HWND, not by name: titles change (Spotify renames its window per track).
 _CAPTURE_META: dict = {}
@@ -51,32 +61,70 @@ def _to_screen(name: str, x, y):
     return r.left + int(x * scale), r.top + int(y * scale)
 
 
+def _grab(r):
+    return ImageGrab.grab(bbox=(r.left, r.top, r.right, r.bottom), all_screens=True)
+
+
+def _thumb(img: Image.Image) -> Image.Image:
+    return img.reduce(_THUMB_REDUCE).convert("L")
+
+
+def _same_screen(a: Image.Image, b: Image.Image) -> bool:
+    if a.size != b.size:  # окно изменило размер — точно не устоялось
+        return False
+    changed = sum(ImageChops.difference(a, b).histogram()[_PIXEL_DELTA:])
+    return changed <= a.width * a.height * _CHANGED_FRACTION
+
+
+def _grab_settled(r):
+    """Кадр окна после того, как экран перестал меняться (два подряд одинаковых кадра
+    с интервалом _SETTLE_INTERVAL). Возвращает (кадр, секунд ожидания, устоялся ли)."""
+    t0 = time.monotonic()
+    img = _grab(r)
+    thumb = _thumb(img)
+    while time.monotonic() - t0 < _SETTLE_TIMEOUT:
+        time.sleep(_SETTLE_INTERVAL)
+        nxt = _grab(r)
+        nxt_thumb = _thumb(nxt)
+        same = _same_screen(thumb, nxt_thumb)
+        img, thumb = nxt, nxt_thumb
+        if same:
+            return img, time.monotonic() - t0, True
+    return img, time.monotonic() - t0, False
+
+
 @tool
-def capture_window(name: str) -> dict:
+def capture_window(name: str, settle: bool = True) -> dict:
     """
     Скриншотит указанное окно и возвращает картинку для анализа. Первый скриншот
     уже приложен к задаче; вызывай это после действий, чтобы увидеть результат.
-    Возвращает изображение и его размер в пикселях —
-    координаты для click_window / scroll_window бери прямо с этой картинки.
+    Сам дожидается, пока экран перестанет меняться (загрузка страницы, анимация),
+    поэтому перед ним НЕ нужно звать waiting. Возвращает изображение и его размер
+    в пикселях — координаты для click_window / scroll_window бери прямо с этой картинки.
 
     Args:
         name (str): Часть заголовка окна (например 'Spotify Premium').
+        settle (bool): Ждать, пока экран устоится (по умолчанию True, до ~4 с).
     """
     hwnd, r = _resolve_window(name)
-    img = ImageGrab.grab(bbox=(r.left, r.top, r.right, r.bottom), all_screens=True)
+    if settle:
+        img, waited, stable = _grab_settled(r)
+        settle_note = f", устоялся за {waited:.2f}с" if stable else f", НЕ устоялся за {waited:.1f}с (анимация/видео?)"
+    else:
+        img, settle_note = _grab(r), ""
     native_w, native_h = img.size
 
     scale = 1.0
     if native_w > _MAX_W:
         scale = native_w / _MAX_W
-        img = img.resize((_MAX_W, int(native_h / scale)), Image.Resampling.LANCZOS)
+        img = img.resize((_MAX_W, int(native_h / scale)), Image.Resampling.BILINEAR)
     _CAPTURE_META[hwnd] = (scale, img.size[0], img.size[1])
 
     buf = BytesIO()
-    img.save(buf, format="JPEG", quality=85, optimize=True)
+    img.save(buf, format="JPEG", quality=85)
     b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
     logging.info(
-        f"[Window Agent] capture_window '{name}': {img.size[0]}x{img.size[1]} px (scale {scale:.2f})"
+        f"[Window Agent] capture_window '{name}': {img.size[0]}x{img.size[1]} px (scale {scale:.2f}){settle_note}"
     )
     return {
         "screenshot_data": b64,

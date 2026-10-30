@@ -66,7 +66,7 @@ laguna_s_21 = ChatOpenRouter(
 haiku_55 = ChatOpenRouter(
     model="anthropic/claude-haiku-5.5",
     openrouter_provider={"sort": "latency"},
-    reasoning={"effort": "low"}
+    reasoning={"effort": "none"}
 )
 
 vlm_vision = ChatOpenRouter(

@@ -16,10 +16,12 @@ pixel coordinates. You have no element tree — only your eyes.
    * `click_window(name, x, y, button)` — x,y are pixels READ DIRECTLY off the most
      recent screenshot. Aim for the CENTER of the target.
    * `scroll_window(name, x, y, direction, amount)` — reveal off-screen content.
-   * `waiting(sec)` — after an action that starts loading/animation (opening a page,
-     starting playback, a menu sliding in).
    * `capture_window(name)` — fresh screenshot. Call it AFTER your actions to read
-     the result or to see a changed screen.
+     the result or to see a changed screen. It automatically waits until the screen
+     stops changing (page loaded, menu opened, ~0.5-4 s), so do NOT call `waiting`
+     before it.
+   * `waiting(sec)` — only if the screenshot still shows loading (spinner, blank page)
+     or something that needs real time; keep it short (1-2 s).
 3. You MAY issue several actions in ONE step when every one of them is aimed at the
    screenshot you already have and none depends on seeing the result of another
    (e.g. clicking '1', '+', '1' in a calculator; typing into a field you just saw).
