@@ -44,17 +44,22 @@ class CommandRequest(BaseModel):
 
 
 # Sliding session history window (up to 15 user-agent request/response pairs)
+ENABLE_SESSION_HISTORY = False  # Temporarily disabled history across API calls
 MAX_HISTORY_TURNS = 15
 SESSION_HISTORY: list[BaseMessage] = []
 
 
 def get_session_messages(prompt_text: str) -> list[BaseMessage]:
     """Builds full message list combining past session history and the new user prompt."""
+    if not ENABLE_SESSION_HISTORY:
+        return [HumanMessage(content=prompt_text)]
     return list(SESSION_HISTORY) + [HumanMessage(content=prompt_text)]
 
 
 def record_session_turn(prompt_text: str, response_text: str):
     """Saves a completed user prompt and agent response pair into the sliding session memory."""
+    if not ENABLE_SESSION_HISTORY:
+        return
     global SESSION_HISTORY
     from langchain_core.messages import AIMessage
     SESSION_HISTORY.append(HumanMessage(content=prompt_text))
@@ -133,6 +138,7 @@ async def root():
     return {
         "name": "Atlas AI-PC-Control API",
         "status": "running",
+        "session_history_enabled": ENABLE_SESSION_HISTORY,
         "session_history_turns": len(SESSION_HISTORY) // 2,
         "endpoints": {
             "POST /api/execute": "Execute PC task (synchronously or asynchronously)",
