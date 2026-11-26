@@ -1,162 +1,167 @@
-# Atlas AI PC Control 🤖🖥️
+<div align="center">
 
-**Atlas AI PC Control** is a universal multi-agent AI system designed for complete automation and control of Windows PCs.
+# Atlas AI PC Control
 
-The system combines high-speed terminal execution (PowerShell/CMD) with a vision-language model that reads screenshots to interact directly with graphical user interfaces (GUI) across any desktop application.
+Multi-agent AI system for automating Windows PCs via PowerShell, screenshot-driven VLM GUI control, REST API, and local voice.
 
----
+![Python](https://img.shields.io/badge/Python-3.10--3.12-111827?style=flat-square)
+![Platform](https://img.shields.io/badge/Platform-Windows-374151?style=flat-square)
+![LangGraph](https://img.shields.io/badge/Agent-LangGraph-1f2937?style=flat-square)
 
-## 🌟 Key Features
+</div>
 
-- 🚀 **Hybrid Control (Terminal-First & Vision GUI):**
-  - Prioritizes high-speed execution via console commands (file management, system queries, process execution).
-  - Automatically delegates to the **Window Agent** whenever UI interaction (buttons, menus, input fields) is required.
-- 👁️ **Screenshot-driven Window Agent (VLM):**
-  - A vision-language model (Claude Haiku 5.5 via OpenRouter) looks at a screenshot of the target window, acts with the keyboard and pixel clicks, and re-captures the window to read the result. One agent for every app — native Windows apps, Electron/Chromium apps, games.
-- 🖱️ **Agent Cursor:**
-  - A small pixel pointer on screen shows where the agent is about to click (stepped motion, click ripple). It appears in both the voice app and the server — in server mode only while the agent works with windows. It vanishes for the instant of the model's screenshot so it never covers the target. Disable with `ATLAS_CURSOR=0`.
-- ⌨️ **Bulletproof Keyboard & Mouse Emulation:**
-  - Full Unicode and multi-language support (Cyrillic, CJK, emojis) using isolated clipboard injection (`Shift + Insert`).
-  - Immune to system keyboard layout switching and Windows 11 UWP application constraints.
-- 🔌 **Flexible REST API & Background Task Queue:**
-  - Built-in **FastAPI** server supporting both synchronous HTTP requests and background asynchronous task execution.
-- 🌐 **Extensible WebSocket Protocol:**
-  - Bi-directional WebSocket client support for remote control by external AI companions or custom platforms (e.g. Data-Sama integration).
-- 🎙️ **Local Voice Interface (GUI Mode):**
-  - Autonomous speech recognition (**Vosk ASR**) and local speech synthesis (**Silero TTS / gTTS**) for real-time voice control.
+<!-- Add screenshot or demo GIF here, e.g.:
+![Atlas AI PC Control preview](./docs/preview.png)
+-->
 
----
+## Features
 
-## 🏗️ Architecture Overview
+- **Hybrid Terminal & GUI Control** — Prioritizes PowerShell command execution for file, process, and system operations, delegating UI tasks to a dedicated Window Agent.
+- **Screenshot-Driven Window Agent (VLM)** — Captures the target window, performs keyboard actions, scrolling, and pixel clicks via a vision-language model (`agent/window_agent.py`), and re-captures to verify results across native Windows, Electron/Chromium apps, and games.
+- **Multi-Language Input Emulation** — Handles Unicode text input (including Cyrillic, CJK, and symbols) via clipboard injection to avoid keyboard layout and UWP window constraints.
+- **REST API & Background Queue** — Exposes a FastAPI server supporting both synchronous task execution and asynchronous background task dispatch.
+- **WebSocket Integration Client** — Connects to external orchestrators (such as Data-Sama) to stream task status updates and return asynchronous tool results.
+- **Local Voice Interface & Overlay** — Desktop voice mode with Vosk wake-word detection, faster-whisper transcription, Silero TTS / gTTS output, auto-downloaded voice weights, and a custom desktop subtitle overlay.
 
-```
-                               ┌───────────────────────────┐
-                               │        User / Client      │
-                               └─────────────┬─────────────┘
-                                             │
-                       ┌─────────────────────┴─────────────────────┐
-                       ▼                                           ▼
-         ┌───────────────────────────┐               ┌───────────────────────────┐
-         │     REST API & WebSockets │               │    Local Voice GUI (main) │
-         │   server.py / FastAPI     │               │  Vosk ASR + Silero TTS    │
-         └─────────────┬─────────────┘               └─────────────┬─────────────┘
-                       │                                           │
-                       └─────────────────────┬─────────────────────┘
-                                             ▼
-                               ┌───────────────────────────┐
-                               │     Atlas Main Agent      │
-                               │   (agent/prompts/main)    │
-                               └─────────────┬─────────────┘
-                                             │
-                      ┌──────────────────────┴──────────────────────┐
-                      ▼                                             ▼
-       ┌───────────────────────────┐                 ┌───────────────────────────┐
-       │     Terminal (PowerShell) │                 │     Window Agent (GUI)    │
-       │   execute_bash_command    │                 │   (prompts/window_agent)  │
-       └───────────────────────────┘                 └─────────────┬─────────────┘
-                                                                   │
-                                                                   ▼
-                                                     ┌───────────────────────────┐
-                                                     │  VLM + screenshots        │
-                                                     │  keyboard / pixel clicks  │
-                                                     └───────────────────────────┘
+## Architecture
+
+```text
+                       ┌───────────────────────────┐
+                       │       User / Client       │
+                       └─────────────┬─────────────┘
+                                     │
+               ┌─────────────────────┴─────────────────────┐
+               ▼                                           ▼
+ ┌───────────────────────────┐               ┌───────────────────────────┐
+ │   REST API & WebSocket    │               │    Local Voice GUI        │
+ │  server.py / FastAPI      │               │  main.py (Vosk + Whisper) │
+ └─────────────┬─────────────┘               └─────────────┬─────────────┘
+               │                                           │
+               └─────────────────────┬─────────────────────┘
+                                     ▼
+                       ┌───────────────────────────┐
+                       │     Atlas Main Agent      │
+                       │  LangGraph / OpenRouter   │
+                       └─────────────┬─────────────┘
+                                     │
+              ┌──────────────────────┴──────────────────────┐
+              ▼                                             ▼
+┌───────────────────────────┐                 ┌───────────────────────────┐
+│   Terminal (PowerShell)   │                 │   Window Agent (GUI)      │
+│   execute_bash_command    │                 │   interact_with_window    │
+└───────────────────────────┘                 └─────────────┬─────────────┘
+                                                            │
+                                                            ▼
+                                              ┌───────────────────────────┐
+                                              │    VLM + Screenshots      │
+                                              │  keyboard / pixel clicks  │
+                                              └───────────────────────────┘
 ```
 
----
+## Tech Stack
 
-## 🛠️ Installation & Setup
+| Layer | Technology |
+| :--- | :--- |
+| Agent Orchestration | LangGraph, LangChain, OpenRouter |
+| GUI Automation | Vision-language model (OpenRouter), OpenCV, Pillow |
+| API & Realtime | FastAPI, Uvicorn, WebSockets |
+| Voice & Overlay | Vosk, faster-whisper, Silero TTS / gTTS, WebRTC VAD, Pygame |
 
-### 1. Prerequisites
-- **OS:** Windows 10 / 11
-- **Python:** 3.10 – 3.12
-- **PyTorch:** needed only for the local voice interface (Silero TTS).
+## Getting Started
 
-### 2. Clone Repository & Install Dependencies
+### Prerequisites
+
+- Windows 10 or Windows 11
+- Python 3.10 – 3.12
+- PyTorch (required for local voice mode / Silero TTS)
+- An [OpenRouter](https://openrouter.ai/) API key
+
+### Installation
+
 ```bash
-git clone https://github.com/Oatis123/AI-PC-Contol.git
-cd AI-PC-Contol
+git clone https://github.com/Oatis123/Atlas-AI-PC-Control.git
+cd Atlas-AI-PC-Control
 
-# Create virtual environment
 python -m venv venv
 venv\Scripts\activate
 
-# Install dependencies
 pip install -r requirements.txt
 ```
 
-### 3. Environment Configuration (`.env`)
-Create a `.env` file in the project root directory:
-```env
-OPENROUTER_API_KEY=your_openrouter_api_key_here
-```
+## Configuration
 
----
+Create a `.env` file in the project root:
 
-## 🚀 Usage
+| Variable | Required | Default | Description |
+| :--- | :---: | :--- | :--- |
+| `OPENROUTER_API_KEY` | Yes | — | API key used by `agent/models/openrouter_models.py` to call LLM and VLM models via OpenRouter |
 
-### Option 1: Start API Server (`server.py`)
-Run the REST API server for external program integration:
+## Usage
+
+### API Server
+
+Start the FastAPI server (listens on `http://127.0.0.1:5050`):
+
 ```bash
 python server.py
 ```
-The server will run at `http://127.0.0.1:5050`.
 
-#### API Usage Examples:
+| Endpoint | Method | Description |
+| :--- | :--- | :--- |
+| `/` | `GET` | Health check and available endpoints |
+| `/api/execute` | `POST` | Run an agent prompt synchronously or in the background |
+| `/tools/run-pc-agent` | `POST` | Async tool execution endpoint for Data-Sama integration |
+| `/run` | `POST` | Legacy endpoint for executing a list of commands |
 
-* **Synchronous Task Execution (`async_mode: false`):**
-  ```bash
-  curl -X POST "http://127.0.0.1:5050/api/execute" \
-       -H "Content-Type: application/json" \
-       -d '{"prompt": "Open calculator and multiply 25 by 4"}'
-  ```
+Synchronous request:
 
-* **Asynchronous Task Execution (`async_mode: true`):**
-  ```bash
-  curl -X POST "http://127.0.0.1:5050/api/execute" \
-       -H "Content-Type: application/json" \
-       -d '{"prompt": "Create folder Test on desktop", "async_mode": true}'
-  ```
+```bash
+curl -X POST "http://127.0.0.1:5050/api/execute" \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "Open calculator and multiply 25 by 4"}'
+```
 
----
+Asynchronous background request:
 
-### Option 2: Local Voice Assistant (`main.py`)
-Run the local voice-activated assistant:
+```bash
+curl -X POST "http://127.0.0.1:5050/api/execute" \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "Create folder Test on desktop", "async_mode": true}'
+```
+
+### Local Voice Assistant
+
+Start the voice-controlled desktop assistant (Vosk and Silero TTS weights are downloaded automatically on first run via `utils/model_setup.py`):
+
 ```bash
 python main.py
 ```
 
+## Project Structure
+
+```text
+Atlas-AI-PC-Control/
+├── agent/
+│   ├── agent.py                 # Main LangGraph agent and tool router
+│   ├── window_agent.py          # Screenshot-driven VLM window agent
+│   ├── models/                  # OpenRouter model configurations
+│   ├── prompts/                 # System prompts for main and window agents
+│   └── tools/                   # PowerShell, vision, screen, and web tools
+├── assets/
+│   ├── fonts/                   # Overlay fonts
+│   └── sounds/                  # Voice activation audio cues
+├── gui/
+│   └── overlay.py               # Desktop voice and subtitle overlay
+├── utils/
+│   ├── logging_setup.py         # Logging configuration
+│   ├── media_utils.py           # Media and playback helpers
+│   └── model_setup.py           # Auto-provisioning for Vosk and Silero models
+├── datasama_client.py           # WebSocket client for Data-Sama integration
+├── main.py                      # Local voice assistant entry point
+├── server.py                    # FastAPI server entry point
+└── requirements.txt
+```
+
 ---
 
-## 📂 Repository Structure
-
-```
-AI-PC-Contol/
-├── agent/                         # Multi-agent core logic
-│   ├── agent.py                   # Main agent and task router
-│   ├── window_agent.py            # Screenshot-driven window agent (interact_with_window)
-│   ├── models/                    # LLM bindings (OpenRouter / LangChain)
-│   ├── prompts/                   # System prompts for main and window agents
-│   └── tools/                     # System control tools (pc_control_tools.py, vision_control_tools.py)
-├── gui/                           # Visual overlay components (overlay.py)
-├── utils/                         # Helper utilities
-├── datasama_client.py             # WebSocket client for external platform integration
-├── main.py                        # Voice GUI app with Vosk ASR & Silero TTS
-├── server.py                      # FastAPI server (REST API + WS)
-├── requirements.txt               # Python package dependencies
-└── README.md                      # Project documentation
-```
-
----
-
-## 📝 License
-This project is licensed under the MIT License.
-
-<br/>
-
-<p align="center">
-  &nbsp;&nbsp;/&#92;_/\&nbsp;&nbsp;<br/>
-  &nbsp;( o.o )&nbsp;<br/>
-  &nbsp;&nbsp;&gt;&nbsp;^&nbsp;&lt;&nbsp;&nbsp;<br/>
-  <br/>
-  <b>Made with ❤️</b>
-</p>
+<p align="center">made with 💚</p>
