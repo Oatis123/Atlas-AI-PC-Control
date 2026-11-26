@@ -3,10 +3,10 @@ import json
 import logging
 import websockets
 
-logger = logging.getLogger("DataSamaClient")
+logger = logging.getLogger("VivionClient")
 
 
-class DataSamaClient:
+class VivionClient:
     def __init__(
         self,
         ws_url: str = "ws://127.0.0.1:2026/ws/integrations",
@@ -36,15 +36,15 @@ class DataSamaClient:
     async def _connect_loop(self):
         while self._running:
             try:
-                logger.info(f"Connecting to Data-Sama WebSocket at {self.ws_url}...")
+                logger.info(f"Connecting to Vivion WebSocket at {self.ws_url}...")
                 async with websockets.connect(self.ws_url) as ws:
                     self.websocket = ws
-                    logger.info("Connected to Data-Sama WebSocket.")
+                    logger.info("Connected to Vivion WebSocket.")
                     await self._send_init()
 
                     # Keep reading incoming messages if any
                     async for message in ws:
-                        logger.info(f"Received message from Data-Sama: {message}")
+                        logger.info(f"Received message from Vivion: {message}")
             except (websockets.exceptions.ConnectionClosed, OSError, Exception) as e:
                 self.websocket = None
                 if not self._running:

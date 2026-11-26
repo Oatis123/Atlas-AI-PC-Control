@@ -9,15 +9,15 @@ from utils.logging_setup import setup_logging
 setup_logging()
 
 from agent.agent import request_to_agent_async, request_to_agent_sync
-from datasama_client import DataSamaClient
+from vivion_client import VivionClient
 
-datasama_client = DataSamaClient()
+vivion_client = VivionClient()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup: Start WebSocket connection loop to Data-Sama
-    logging.info("Starting Data-Sama integration client...")
-    await datasama_client.start()
+    # Startup: Start WebSocket connection loop to Vivion
+    logging.info("Starting Vivion integration client...")
+    await vivion_client.start()
     
     # Warm up the installed-apps cache (PowerShell queries) in background thread
     try:
@@ -28,8 +28,8 @@ async def lifespan(app: FastAPI):
 
     yield
     # Shutdown: Stop WebSocket connection
-    logging.info("Stopping Data-Sama integration client...")
-    await datasama_client.stop()
+    logging.info("Stopping Vivion integration client...")
+    await vivion_client.stop()
 
 app = FastAPI(title="AI-PC-Control Server Mode", lifespan=lifespan)
 
@@ -78,7 +78,7 @@ async def _execute_pc_task_background(prompt_text: str):
         logging.info(f"--- [TASK START] Processing prompt: '{prompt_text}' ---")
         
         # 1. Send single background state update over WS
-        await datasama_client.send_background_update(f"Executing task: {prompt_text}")
+        await vivion_client.send_background_update(f"Executing task: {prompt_text}")
 
         # 2. Execute local PC control agent with session memory
         messages = get_session_messages(prompt_text)
@@ -101,26 +101,26 @@ async def _execute_pc_task_background(prompt_text: str):
         # Record this turn into session history
         record_session_turn(prompt_text, final_content)
 
-        logging.info(f"--- [TASK FINISHED] Sending tool_result to Data-Sama: '{final_content}' ---")
+        logging.info(f"--- [TASK FINISHED] Sending tool_result to Vivion: '{final_content}' ---")
 
         # Clear background state so old status doesn't linger in Vivion
-        await datasama_client.send_background_update("")
+        await vivion_client.send_background_update("")
 
         # 3. Send final tool_result over WS
-        await datasama_client.send_tool_result(
+        await vivion_client.send_tool_result(
             tool_name="execute_pc_task",
             status="success",
             output=final_content
         )
-        logging.info("--- [WS SENT] tool_result successfully sent to Data-Sama! ---")
+        logging.info("--- [WS SENT] tool_result successfully sent to Vivion! ---")
     except Exception as e:
         logging.error(f"Error executing agent task '{prompt_text}': {e}", exc_info=True)
         try:
-            await datasama_client.send_background_update("")
+            await vivion_client.send_background_update("")
         except Exception as bg_err:
             logging.warning(f"Failed to reset background update on error: {bg_err}")
 
-        await datasama_client.send_tool_result(
+        await vivion_client.send_tool_result(
             tool_name="execute_pc_task",
             status="error",
             output=f"Error executing task on PC: {str(e)}"
@@ -144,7 +144,7 @@ async def root():
             "POST /api/execute": "Execute PC task (synchronously or asynchronously)",
             "POST /api/clear-history": "Clear session message history",
             "POST /run": "Direct command list execution (legacy)",
-            "POST /tools/run-pc-agent": "Data-Sama integration endpoint"
+            "POST /tools/run-pc-agent": "Vivion integration endpoint"
         }
     }
 
@@ -221,8 +221,8 @@ async def execute_user_task(data: TaskRequest, background_tasks: BackgroundTasks
 @app.post("/tools/run-pc-agent")
 async def run_pc_agent(payload: dict, background_tasks: BackgroundTasks):
     """
-    Data-Sama async tool execution endpoint.
-    Expects payload format from Data-Sama:
+    Vivion async tool execution endpoint.
+    Expects payload format from Vivion:
     {"tool_name": "execute_pc_task", "arguments": {"prompt": "..."}}
     """
     arguments = payload.get("arguments", {})

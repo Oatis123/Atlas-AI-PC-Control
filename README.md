@@ -20,7 +20,7 @@ Multi-agent AI system for automating Windows PCs via PowerShell, screenshot-driv
 - **Screenshot-Driven Window Agent (VLM)** — Captures the target window, performs keyboard actions, scrolling, and pixel clicks via a vision-language model (`agent/window_agent.py`), and re-captures to verify results across native Windows, Electron/Chromium apps, and games.
 - **Multi-Language Input Emulation** — Handles Unicode text input (including Cyrillic, CJK, and symbols) via clipboard injection to avoid keyboard layout and UWP window constraints.
 - **REST API & Background Queue** — Exposes a FastAPI server supporting both synchronous task execution and asynchronous background task dispatch.
-- **WebSocket Integration Client** — Connects to external orchestrators (such as Data-Sama) to stream task status updates and return asynchronous tool results.
+- **WebSocket Integration Client** — Connects to external orchestrators (such as Vivion) to stream task status updates and return asynchronous tool results.
 - **Local Voice Interface & Overlay** — Desktop voice mode with Vosk wake-word detection, faster-whisper transcription, Silero TTS / gTTS output, auto-downloaded voice weights, and a custom desktop subtitle overlay.
 
 ## Architecture
@@ -110,7 +110,8 @@ python server.py
 | :--- | :--- | :--- |
 | `/` | `GET` | Health check and available endpoints |
 | `/api/execute` | `POST` | Run an agent prompt synchronously or in the background |
-| `/tools/run-pc-agent` | `POST` | Async tool execution endpoint for Data-Sama integration |
+| `/api/clear-history` | `POST` | Clear session message history |
+| `/tools/run-pc-agent` | `POST` | Async tool execution endpoint for Vivion integration |
 | `/run` | `POST` | Legacy endpoint for executing a list of commands |
 
 Synchronous request:
@@ -156,7 +157,7 @@ Atlas-AI-PC-Control/
 │   ├── logging_setup.py         # Logging configuration
 │   ├── media_utils.py           # Media and playback helpers
 │   └── model_setup.py           # Auto-provisioning for Vosk and Silero models
-├── datasama_client.py           # WebSocket client for Data-Sama integration
+├── vivion_client.py             # WebSocket client for Vivion integration
 ├── main.py                      # Local voice assistant entry point
 ├── server.py                    # FastAPI server entry point
 └── requirements.txt
